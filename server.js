@@ -45,7 +45,7 @@ const MODEL_MAPPING = {
   'gpt-4o': 'deepseek-ai/deepseek-v4-pro',
   'claude-3-opus': 'openai/gpt-oss-120b',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
-  'gemini-pro': 'qwen/qwen3.5-397b-a17b',
+  'gemini-pro': 'nvidia/llama-3.3-nemotron-super-49b-v1.5',
   'gpt-4-flash': 'deepseek-ai/deepseek-v4-flash',
   'glm-5.1': 'z-ai/glm-5.1',
   'glm-4.7': 'z-ai/glm4.7',
