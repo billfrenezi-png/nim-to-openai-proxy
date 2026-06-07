@@ -513,8 +513,8 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
 });
 
-app.all('*', (req, res) => {
-  // FIX: Express 5 — use res.status().json() instead of res.json(status, obj)
+// Catch-all — must use named wildcard in Express 5
+app.all('/*path', (req, res) => {
   res.status(404).json({
     error: {
       message: `Endpoint ${req.path} not found`,
@@ -523,6 +523,12 @@ app.all('*', (req, res) => {
     }
   });
 });
+
+app.listen(PORT, () => {
+  console.log(`[PROXY] Hybrid proxy running on port ${PORT}`);
+  console.log(`[PROXY] Max tokens limit: ${MAX_TOKENS_LIMIT}`);
+});
+
 
 app.listen(PORT, () => {
   console.log(`[PROXY] Hybrid proxy running on port ${PORT}`);
