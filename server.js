@@ -1,5 +1,6 @@
 // server.js - Hybrid OpenAI ↔ NIM Proxy
 // Fixed: stream death, JSON vomit, silent buffer loss, missing error propagation
+// Express 5 Compatible
 
 const express = require('express');
 const cors = require('cors');
@@ -22,6 +23,7 @@ app.use((req, res, next) => {
   const expected = `Bearer ${process.env.CLIENT_AUTH_KEY}`;
 
   if (!auth || !expected || auth.length !== expected.length) {
+    // FIX: Express 5 — use res.status().json() instead of res.json(status, obj)
     return res.status(403).json({
       error: {
         message: 'Forbidden',
@@ -486,6 +488,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     console.error('[PROXY] NIM response:', error.response?.data);
 
     if (!res.headersSent) {
+      // FIX: Express 5 — use res.status().json() instead of res.json(status, obj)
       res.status(error.response?.status || 500).json({
         error: {
           message: error.message,
@@ -511,6 +514,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 });
 
 app.all('*', (req, res) => {
+  // FIX: Express 5 — use res.status().json() instead of res.json(status, obj)
   res.status(404).json({
     error: {
       message: `Endpoint ${req.path} not found`,
