@@ -26,7 +26,7 @@ const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const MAX_TOKENS_LIMIT = 65536;
 const REQUEST_TIMEOUT_MS = 180000;
 const VALIDATION_TIMEOUT_MS = 15000;
-const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
+const MAX_BUFFER_SIZE = 1024 * 1024;
 
 if (SHOW_REASONING) console.log('[CONFIG] Reasoning display: ENABLED');
 if (ENABLE_THINKING_MODE) console.log('[CONFIG] Thinking mode: ENABLED');
@@ -84,45 +84,25 @@ const FALLBACK_MODELS = [
 
 // PATCH: ─── Thinking Model Configuration ───────────────────────────────────
 
-// Models known to support/need explicit thinking parameters
-// mode: 'auto' = always thinks, no API flag needed (DeepSeek, Kimi, GLM, MiniMax)
-// mode: 'hybrid' = needs explicit flag (Qwen: enable_thinking)
-// mode: 'prompt' = controlled via system prompt, not API flag (Nemotron)
 const THINKING_MODEL_CONFIG = {
-  // DeepSeek V4 family: Always thinks, returns reasoning_content + content
   'deepseek-ai/deepseek-v4-pro': { mode: 'auto', param: null },
   'deepseek-ai/deepseek-v4-flash': { mode: 'auto', param: null },
-  
-  // Qwen 3.5: Hybrid thinking — needs enable_thinking flag
   'qwen/qwen3.5-397b-a17b': { mode: 'hybrid', param: 'enable_thinking' },
-  
-  // Nemotron 3: Uses system prompt control ("detailed thinking on"/"off")
   'nvidia/nemotron-3-super-120b-a12b': { mode: 'prompt', param: null },
   'nvidia/nemotron-3-ultra-550b-a55b': { mode: 'prompt', param: null },
-  
-  // Kimi K2: Always thinks
   'moonshotai/kimi-k2.6': { mode: 'auto', param: null },
-  
-  // GLM: Emits inline <thinking> tags
   'z-ai/glm-5.1': { mode: 'auto', param: null },
-  
-  // MiniMax: Always thinks
   'minimaxai/minimax-m2.7': { mode: 'auto', param: null },
   'minimaxai/minimax-m3': { mode: 'auto', param: null },
-  
-  // Step: Always thinks
   'stepfun-ai/step-3.5-flash': { mode: 'auto', param: null },
   'stepfun-ai/step-3.7-flash': { mode: 'auto', param: null },
 };
-
 
 // ─── Middleware ─────────────────────────────────────────────────────────────
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// FIX: Extract token AFTER "Bearer " prefix, compare only the token
-// Prevents bypass when CLIENT_AUTH_KEY is empty (expected would be "Bearer " which is 7 chars)
 function extractBearerToken(authHeader) {
   if (!authHeader || typeof authHeader !== 'string') return null;
   const parts = authHeader.trim().split(' ');
@@ -171,8 +151,6 @@ app.use((req, res, next) => {
 
 // ─── Validation ─────────────────────────────────────────────────────────────
 
-// FIX: Use lightweight model listing instead of burning inference quota
-// If NIM doesn't support /models, skip validation entirely rather than DDoS-ing yourself
 async function validateModels() {
   if (SKIP_VALIDATION) {
     console.log('[VALIDATION] Skipped (SKIP_VALIDATION=true)');
@@ -245,7 +223,6 @@ async function sendDiscordAlert(invalidModels) {
 
 // ─── Helper: Safe Stream Writing ───────────────────────────────────────────
 
-// FIX: Wrap res.write in try/catch to prevent crashes on closed sockets
 function safeWrite(res, data) {
   try {
     if (!res.writableEnded && !res.destroyed && res.writable) {
@@ -267,15 +244,12 @@ function extractThinkingContent(message) {
   let reasoning = message.reasoning_content || null;
   let isPromoted = false;
   
-  // BUG FIX: Some models (Qwen 3.5 on NIM) put the actual answer in reasoning_content
-  // when content is null/empty. Promote it to content so we don't lose the answer.
   if (!content && reasoning) {
     content = reasoning;
     reasoning = null;
     isPromoted = true;
   }
   
-  // Handle inline <thinking> tags (GLM-style and some DeepSeek formats)
   if (content && content.includes('<thinking>')) {
     const thinkMatch = content.match(/<thinking>([\s\S]*?)<\/thinking>/);
     if (thinkMatch) {
@@ -291,10 +265,7 @@ function extractThinkingContent(message) {
 
 function formatWithReasoning(content, reasoning, showReasoning) {
   if (!showReasoning || !reasoning) return content;
-  
-  // Don't double-wrap if already wrapped
   if (content.includes('<thinking>')) return content;
-  
   const safeReasoning = reasoning.replace(/\n/g, '\\n');
   return `<thinking>\n${safeReasoning}\n</thinking>\n\n${content}`;
 }
@@ -303,17 +274,12 @@ function formatWithReasoning(content, reasoning, showReasoning) {
 
 function buildThinkingRequest(baseRequest, modelId, enableThinking) {
   const config = THINKING_MODEL_CONFIG[modelId];
-  
-  // If model not in config or thinking not explicitly toggled, return as-is
   if (!config) return baseRequest;
   
   const extraBody = baseRequest.extra_body ? { ...baseRequest.extra_body } : {};
   
   switch (config.mode) {
     case 'hybrid':
-      // Qwen-style: inject enable_thinking into extra_body
-      // If ENABLE_THINKING_MODE is true, enable. If false, explicitly disable.
-      // If undefined, don't set (model default).
       if (enableThinking !== undefined) {
         extraBody[config.param] = enableThinking;
         console.log(`[THINKING] ${modelId}: set ${config.param}=${enableThinking}`);
@@ -321,8 +287,6 @@ function buildThinkingRequest(baseRequest, modelId, enableThinking) {
       break;
       
     case 'prompt':
-      // Nemotron-style: thinking controlled by system prompt
-      // Log a reminder if user expects thinking but didn't set system prompt
       if (enableThinking) {
         const hasThinkingPrompt = baseRequest.messages?.some(
           m => m.role === 'system' && 
@@ -336,8 +300,6 @@ function buildThinkingRequest(baseRequest, modelId, enableThinking) {
       break;
       
     case 'auto':
-      // DeepSeek/Kimi/GLM/MiniMax: always thinks or no API control
-      // No extra parameter needed, but log for visibility
       if (enableThinking) {
         console.log(`[THINKING] ${modelId}: Model thinks automatically, no API flag needed.`);
       }
@@ -357,7 +319,6 @@ async function callWithFallback(baseRequest, models) {
 
   for (const model of models) {
     try {
-      // PATCH: Apply thinking model configuration before each attempt
       const thinkingRequest = buildThinkingRequest(baseRequest, model, ENABLE_THINKING_MODE);
       
       const res = await axios.post(
@@ -391,7 +352,7 @@ async function callWithFallback(baseRequest, models) {
 // ─── Routes ────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '2.2.0' }); // PATCH: bumped version
+  res.json({ status: 'ok', version: '2.2.0' });
 });
 
 app.get('/v1/models', (req, res) => {
@@ -435,7 +396,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       tools: req.body.tools,
       tool_choice: req.body.tool_choice,
       response_format: req.body.response_format,
-      // PATCH: Removed hardcoded chat_template_kwargs. Now handled by buildThinkingRequest().
       extra_body: undefined
     };
 
@@ -479,12 +439,10 @@ app.post('/v1/chat/completions', async (req, res) => {
           const data = JSON.parse(line.slice(6));
           const delta = data.choices?.[0]?.delta;
 
-          // PATCH: Replaced old reasoning logic with extractThinkingContent
           if (delta) {
             const { content: extractedContent, reasoning, isPromoted } = extractThinkingContent(delta);
             let content = extractedContent;
 
-            // If reasoning exists and SHOW_REASONING is on, wrap it
             if (SHOW_REASONING && reasoning && !isPromoted) {
               if (reasoning && !reasoningOpen) {
                 content = `<thinking>\n${reasoning.replace(/\n/g, '\\n')}`;
@@ -506,7 +464,6 @@ app.post('/v1/chat/completions', async (req, res) => {
           safeWrite(res, `data: ${JSON.stringify(data)}\n\n`);
 
         } catch (parseErr) {
-          // FIX: Don't silently swallow—send error to client so they know data was lost
           console.warn('[STREAM] Invalid JSON line:', line.slice(0, 100));
           safeWrite(res, `data: ${JSON.stringify({ 
             error: { 
@@ -580,10 +537,98 @@ app.post('/v1/chat/completions', async (req, res) => {
         cleanup();
       });
 
-      // FIX: Check req.destroyed (Node/Express 5) 
-      // Don't destroy already-finished streams
       req.on('close', () => {
         const clientGone = req.destroyed || !res.writable;
         
         if (!streamEndedCleanly && clientGone) {
-          console.warn('[STREAM] Clie
+          console.warn('[STREAM] Client disconnected prematurely');
+        }
+
+        if (upstreamStream && !upstreamStream.destroyed && !streamEndedCleanly) {
+          upstreamStream.destroy();
+        }
+        cleanup();
+      });
+
+    } else {
+      const openaiResponse = {
+        id: `chatcmpl-${Date.now()}`,
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: model,
+        choices: (response.data.choices || []).map((choice, i) => {
+          const { content: extractedContent, reasoning } = extractThinkingContent(choice.message);
+          let content = formatWithReasoning(extractedContent, reasoning, SHOW_REASONING);
+
+          return {
+            index: i,
+            message: {
+              role: choice.message?.role || 'assistant',
+              content,
+              tool_calls: choice.message?.tool_calls
+            },
+            finish_reason: choice.finish_reason || 'stop'
+          };
+        }),
+        usage: response.data.usage || {
+          prompt_tokens: 0,
+          completion_tokens: 0,
+          total_tokens: 0
+        }
+      };
+
+      res.json(openaiResponse);
+    }
+
+  } catch (error) {
+    console.error('[PROXY] Fatal error:', error.message);
+    console.error('[PROXY] NIM response:', error.response?.data);
+
+    if (!res.headersSent) {
+      res.status(error.response?.status || 500).json({
+        error: {
+          message: error.message,
+          type: 'invalid_request_error',
+          code: error.response?.status || 500
+        }
+      });
+    } else if (!res.writableEnded) {
+      safeWrite(res, `data: ${JSON.stringify({
+        error: {
+          message: error.message,
+          type: 'proxy_error'
+        }
+      })}\n\n`);
+      safeWrite(res, 'data: [DONE]\n\n');
+      res.end();
+    }
+
+    if (upstreamStream && !upstreamStream.destroyed) {
+      upstreamStream.destroy();
+    }
+  }
+});
+
+app.use((req, res) => {
+  res.status(404).json({
+    error: {
+      message: `Endpoint ${req.method} ${req.path} not found`,
+      type: 'invalid_request_error',
+      code: 404
+    }
+  });
+});
+
+// ─── Startup ───────────────────────────────────────────────────────────────
+
+app.listen(PORT, () => {
+  console.log(`[PROXY] Hybrid proxy running on port ${PORT}`);
+  console.log(`[PROXY] Max tokens limit: ${MAX_TOKENS_LIMIT}`);
+  console.log(`[PROXY] Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'disabled'}`);
+  console.log(`[PROXY] Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'disabled'}`);
+  
+  validateModels().catch(err => {
+    console.error('[VALIDATION] Startup check failed:', err.message);
+  });
+});
+  
