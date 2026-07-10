@@ -74,13 +74,6 @@ const MODEL_MAPPING = {
   'step-3.7-flash': 'stepfun-ai/step-3.7-flash'
 };
 
-const FALLBACK_MODELS = [
-  'mistralai/mistral-medium-3.5-128b',
-  'mistralai/mistral-small-4-119b-2603',
-  'nvidia/llama-3.3-nemotron-super-49b-v1.5',
-  'google/gemma-4-31b-it'
-];
-
 // ─── Middleware ─────────────────────────────────────────────────────────────
 
 app.use(cors());
@@ -223,41 +216,6 @@ function safeWrite(res, data) {
   return false;
 }
 
-// ─── Helper: Fallback Chain ─────────────────────────────────────────────────
-
-async function callWithFallback(baseRequest, models) {
-  let lastError = null;
-
-  for (const model of models) {
-    try {
-      const res = await axios.post(
-        `${NIM_API_BASE}/chat/completions`,
-        { ...baseRequest, model },
-        {
-          headers: {
-            Authorization: `Bearer ${NIM_API_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          responseType: baseRequest.stream ? 'stream' : 'json',
-          timeout: REQUEST_TIMEOUT_MS
-        }
-      );
-
-      return { response: res, model };
-
-    } catch (err) {
-      lastError = err;
-      console.warn(
-        `[FALLBACK] Model failed: ${model}`,
-        err.response?.status,
-        err.response?.data?.error?.message || err.message
-      );
-    }
-  }
-
-  throw lastError || new Error('All models failed');
-}
-
 // ─── Routes ────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
@@ -289,22 +247,35 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream
     } = req.body;
 
-    const primaryModel = MODEL_MAPPING[model] || 'nvidia/llama-3.3-nemotron-super-49b-v1.5';
-    const modelChain = [primaryModel, ...FALLBACK_MODELS];
+const selectedModel =
+  MODEL_MAPPING[model] || 'nvidia/llama-3.3-nemotron-super-49b-v1.5';
 
-    const baseRequest = {
-      messages,
-      temperature: temperature ?? 0.7,
-      max_tokens: Math.min(max_tokens ?? 2048, MAX_TOKENS_LIMIT),
-      stream: stream || false,
-      extra_body: ENABLE_THINKING_MODE
-        ? { chat_template_kwargs: { thinking: true } }
-        : undefined
-    };
+const requestBody = {
+  model: selectedModel,
+  messages,
+  temperature: temperature ?? 0.7,
+  max_tokens: Math.min(max_tokens ?? 2048, MAX_TOKENS_LIMIT),
+  stream: stream || false,
+  extra_body: ENABLE_THINKING_MODE
+    ? { chat_template_kwargs: { thinking: true } }
+    : undefined
+};
 
-    const { response, model: usedModel } = await callWithFallback(baseRequest, modelChain);
-    upstreamStream = response.data;
-    console.log('[PROXY] Model used:', usedModel);
+const response = await axios.post(
+  `${NIM_API_BASE}/chat/completions`,
+  requestBody,
+  {
+    headers: {
+      Authorization: `Bearer ${NIM_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    responseType: stream ? "stream" : "json",
+    timeout: REQUEST_TIMEOUT_MS
+  }
+);
+
+upstreamStream = response.data;
+console.log("[PROXY] Model:", selectedModel);
 
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
