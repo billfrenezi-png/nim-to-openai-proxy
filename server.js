@@ -250,15 +250,16 @@ app.post('/v1/chat/completions', async (req, res) => {
 const selectedModel =
   MODEL_MAPPING[model] || 'nvidia/llama-3.3-nemotron-super-49b-v1.5';
 
-const lastMessage = messages[messages.length - 1];
-  if (lastMessage.role === "user") {
-    const webResults = await searchWeb(lastMessage.content);
+const html = await axios.get(url);
+const cheerio = require("cheerio");
+
+const $ = cheerio.load(html.data);
+const text = $("body").text();   
     messages.unshift({
-      role: "system",
-      content:
-        "Use these web search results when answering:\n\n" + webResults
-    });
-  }
+  role: "system",
+  content:
+    "The user provided this webpage:\n\n" + text
+});
     
 const requestBody = {
   model: selectedModel,
@@ -512,25 +513,6 @@ app.use((req, res) => {
     }
   });
 });
-// ─── Internet ───────────────────────────────────────────────────────────────
-
-  async function searchWeb(query) {
-    const res = await axios.get(
-      "https://api.search.brave.com/res/v1/web/search",
-    {
-      params: { q: query },
-      headers: {
-        "X-Subscription-Token": process.env.BRAVE_API_KEY
-      }
-    }
-  );
-
-  return res.data.web.results
-    .slice(0, 5)
-    .map(r => `${r.title}\n${r.description}\n${r.url}`)
-    .join("\n\n");
-}
-
 // ─── Startup ───────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
