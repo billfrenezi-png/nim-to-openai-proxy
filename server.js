@@ -584,4 +584,4 @@ app.post("/chat", async (req, res) => {
     );
 
     return res.json(final.data);
-}
+};
