@@ -531,39 +531,57 @@ app.post("/chat", async (req, res) => {
 
     const choice = response.data.choices[0];
 
-    if (choice.message.tool_calls) {
-      const toolCall = choice.message.tool_calls[0];
-      const args = JSON.parse(toolCall.function.arguments);
+  if (choice.message?.tool_calls?.length) {
+    messages.push(choice.message);
 
-      const searchResults = await tavilySearch(args.query);
+    for (const toolCall of choice.message.tool_calls) {
+      if (toolCall.function?.name !== "tavily_search") continue;
 
-      messages.push(choice.message);
+      let args = {};
+
+      try {
+        args = JSON.parse(toolCall.function.arguments || "{}");
+      } catch {
+        args = {};
+      }
+
+      let result;
+
+      try {
+        result = await tavilySearch({
+          query: args.query,
+          search_depth: args.search_depth ?? "basic",
+          max_results: Math.min(args.max_results ?? 5, 10),
+          include_answer: true,
+          include_raw_content: false,
+          include_images: false
+        });
+      } catch (e) {
+        result = {
+          error: "Search failed",
+          message: e.message
+        };
+      }
 
       messages.push({
         role: "tool",
         tool_call_id: toolCall.id,
-        content: JSON.stringify(searchResults),
+        content: JSON.stringify(result)
       });
-
-      const final = await axios.post(
-        `${NIM_API_BASE}/chat/completions`,
-        {
-          model: selectedModel,
-          messages,
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${NIM_API_KEY}`,
-          },
-        }
-      );
-
-      return res.json(final.data);
     }
 
-    return res.json(response.data);
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: err.message });
+    const final = await axios.post(
+      `${NIM_API_BASE}/chat/completions`,
+      {
+        model: selectedModel,
+        messages
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${NIM_API_KEY}`
+        }
+      }
+    );
+
+    return res.json(final.data);
   }
-});
