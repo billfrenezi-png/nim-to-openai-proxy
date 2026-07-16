@@ -516,7 +516,7 @@ app.listen(PORT, () => {
 });
 
 // ─── Tavily Support ───────────────────────────────────────────────────────────────
-app.use(axios());
+
 app.post("/chat", async (req, res) => {
   try {
     const response = await axios.post(
