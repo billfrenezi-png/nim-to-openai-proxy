@@ -514,4 +514,87 @@ app.listen(PORT, () => {
     console.error('[VALIDATION] Startup check failed:', err.message);
   });
 });
-  
+
+// ─── Tavily Support ───────────────────────────────────────────────────────────────
+
+  async function tavilySearch(query) {
+    const response = await axios.post(
+      "https://api.tavily.com/search",
+      {
+        api_key: process.env.TAVILY_API_KEY,
+        query,
+        search_depth: "basic",
+        max_results: 5
+    },
+    {
+        timeout: 15000
+    }
+  );
+    
+    return response.data.results.map(r => ({
+      title: r.title,
+      url: r.url,
+      content: r.content
+  }));
+}
+
+
+  const requestBody = {
+    model: selectedModel,
+    messages,
+    tools: [
+        {
+            type: "function",
+            function: {
+                name: "web_search",
+                description: "Search the live web for current information.",
+                parameters: {
+                    type: "object",
+                    properties: {
+                        query: {
+                            type: "string"
+                        }
+                    },
+                    required: ["query"]
+                }
+            }
+        }
+    ],
+    tool_choice: "auto",
+    stream: false
+};
+
+
+const choice = response.data.choices[0];
+
+if (choice.message.tool_calls) {
+
+    const toolCall = choice.message.tool_calls[0];
+
+    const args = JSON.parse(toolCall.function.arguments);
+
+    const searchResults = await tavilySearch(args.query);
+
+    messages.push(choice.message);
+
+    messages.push({
+        role: "tool",
+        tool_call_id: toolCall.id,
+        content: JSON.stringify(searchResults)
+    });
+
+    const final = await axios.post(
+        `${NIM_API_BASE}/chat/completions`,
+        {
+            model: selectedModel,
+            messages
+        },
+        {
+            headers: {
+                Authorization: `Bearer ${NIM_API_KEY}`
+            }
+        }
+    );
+
+    return res.json(final.data);
+}
