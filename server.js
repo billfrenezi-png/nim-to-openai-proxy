@@ -250,8 +250,6 @@ app.post('/v1/chat/completions', async (req, res) => {
 const selectedModel =
   MODEL_MAPPING[model] || 'nvidia/llama-3.3-nemotron-super-49b-v1.5';
 
-});
-    
 const requestBody = {
   model: selectedModel,
   messages,
@@ -504,6 +502,7 @@ app.use((req, res) => {
     }
   });
 });
+
 // ─── Startup ───────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
