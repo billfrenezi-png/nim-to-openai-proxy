@@ -531,57 +531,61 @@ app.post("/chat", async (req, res) => {
 
     const choice = response.data.choices[0];
 
-  if (choice.message?.tool_calls?.length) {
-    messages.push(choice.message);
+    if (choice.message?.tool_calls?.length) {
+      messages.push(choice.message);
 
-    for (const toolCall of choice.message.tool_calls) {
-      if (toolCall.function?.name !== "tavily_search") continue;
+      for (const toolCall of choice.message.tool_calls) {
+        if (toolCall.function?.name !== "tavily_search") continue;
 
-      let args = {};
+        let args = {};
 
-      try {
-        args = JSON.parse(toolCall.function.arguments || "{}");
-      } catch {
-        args = {};
-      }
-
-      let result;
-
-      try {
-        result = await tavilySearch({
-          query: args.query,
-          search_depth: args.search_depth ?? "basic",
-          max_results: Math.min(args.max_results ?? 5, 10),
-          include_answer: true,
-          include_raw_content: false,
-          include_images: false
-        });
-      } catch (e) {
-        result = {
-          error: "Search failed",
-          message: e.message
-        };
-      }
-
-      messages.push({
-        role: "tool",
-        tool_call_id: toolCall.id,
-        content: JSON.stringify(result)
-      });
-    }
-
-    const final = await axios.post(
-      `${NIM_API_BASE}/chat/completions`,
-      {
-        model: selectedModel,
-        messages
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${NIM_API_KEY}`
+        try {
+          args = JSON.parse(toolCall.function.arguments || "{}");
+        } catch {
+          args = {};
         }
-      }
-    );
 
-    return res.json(final.data);
-};
+        let result;
+
+        try {
+          result = await tavilySearch({
+            query: args.query,
+            search_depth: args.search_depth ?? "basic",
+            max_results: Math.min(args.max_results ?? 5, 10),
+            include_answer: true,
+            include_raw_content: false,
+            include_images: false,
+          });
+        } catch (e) {
+          result = {
+            error: "Search failed",
+            message: e.message,
+          };
+        }
+
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: JSON.stringify(result),
+        });
+      }
+
+      const final = await axios.post(
+        `${NIM_API_BASE}/chat/completions`,
+        {
+          model: selectedModel,
+          messages,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${NIM_API_KEY}`,
+          },
+        }
+      );
+
+      return res.json(final.data);
+    }
+  } catch (err) {
+    // existing error handling
+  }
+});
