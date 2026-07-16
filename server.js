@@ -516,6 +516,7 @@ app.listen(PORT, () => {
 });
 
 // ─── Tavily Support ───────────────────────────────────────────────────────────────
+app.use(axios());
 
 async function tavilySearch(query) {
   const response = await axios.post(
