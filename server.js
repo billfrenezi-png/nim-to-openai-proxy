@@ -251,16 +251,14 @@ const selectedModel =
   MODEL_MAPPING[model] || 'nvidia/llama-3.3-nemotron-super-49b-v1.5';
 
 const lastMessage = messages[messages.length - 1];
-
-if (lastMessage.role === "user") {
-  const webResults = await searchWeb(lastMessage.content);
-
-  messages.unshift({
-    role: "system",
-    content:
-      "Use these web search results when answering:\n\n" + webResults
-  });
-}
+  if (lastMessage.role === "user") {
+    const webResults = await searchWeb(lastMessage.content);
+    messages.unshift({
+      role: "system",
+      content:
+        "Use these web search results when answering:\n\n" + webResults
+    });
+  }
     
 const requestBody = {
   model: selectedModel,
