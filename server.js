@@ -250,15 +250,6 @@ app.post('/v1/chat/completions', async (req, res) => {
 const selectedModel =
   MODEL_MAPPING[model] || 'nvidia/llama-3.3-nemotron-super-49b-v1.5';
 
-const html = await axios.get(url);
-const cheerio = require("cheerio");
-
-const $ = cheerio.load(html.data);
-const text = $("body").text();   
-    messages.unshift({
-  role: "system",
-  content:
-    "The user provided this webpage:\n\n" + text
 });
     
 const requestBody = {
