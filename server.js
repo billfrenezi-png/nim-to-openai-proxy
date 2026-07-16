@@ -251,7 +251,6 @@ const selectedModel =
   MODEL_MAPPING[model] || 'nvidia/llama-3.3-nemotron-super-49b-v1.5';
 
 const lastMessage = messages[messages.length - 1];
-    
   if (lastMessage.role === "user") {
     const webResults = await searchWeb(lastMessage.content);
     messages.unshift({
@@ -514,9 +513,10 @@ app.use((req, res) => {
   });
 });
 // ─── Internet ───────────────────────────────────────────────────────────────
-async function searchWeb(query) {
-  const res = await axios.get(
-    "https://api.search.brave.com/res/v1/web/search",
+
+  async function searchWeb(query) {
+    const res = await axios.get(
+      "https://api.search.brave.com/res/v1/web/search",
     {
       params: { q: query },
       headers: {
@@ -525,6 +525,11 @@ async function searchWeb(query) {
     }
   );
 
+  return res.data.web.results
+    .slice(0, 5)
+    .map(r => `${r.title}\n${r.description}\n${r.url}`)
+    .join("\n\n");
+}
 
 // ─── Startup ───────────────────────────────────────────────────────────────
 
