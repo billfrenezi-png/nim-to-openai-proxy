@@ -517,29 +517,28 @@ app.listen(PORT, () => {
 
 // ─── Tavily Support ───────────────────────────────────────────────────────────────
 
-  async function tavilySearch(query) {
-    const response = await axios.post(
-      "https://api.tavily.com/search",
-      {
-        api_key: process.env.TAVILY_API_KEY,
-        query,
-        search_depth: "basic",
-        max_results: 5
+async function tavilySearch(query) {
+  const response = await axios.post(
+    "https://api.tavily.com/search",
+    {
+      api_key: process.env.TAVILY_API_KEY,
+      query,
+      search_depth: "basic",
+      max_results: 5
     },
     {
         timeout: 15000
     }
   );
-    
-    return response.data.results.map(r => ({
+  
+  return response.data.results.map(r => ({
       title: r.title,
       url: r.url,
       content: r.content
   }));
 }
 
-
-  const requestBody = {
+const requestBody = {
     model: selectedModel,
     messages,
     tools: [
@@ -563,6 +562,7 @@ app.listen(PORT, () => {
     tool_choice: "auto",
     stream: false
 };
+
 const choice = response.data.choices[0];
 
 if (choice.message.tool_calls) {
