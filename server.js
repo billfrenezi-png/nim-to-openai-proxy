@@ -563,8 +563,6 @@ app.listen(PORT, () => {
     tool_choice: "auto",
     stream: false
 };
-
-
 const choice = response.data.choices[0];
 
 if (choice.message.tool_calls) {
