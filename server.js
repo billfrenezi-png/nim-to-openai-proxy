@@ -1,21 +1,6 @@
-@@ -1,41 +1,27 @@
 // server.js — Robust Hybrid OpenAI ↔ NIM Proxy
 // Express 5 Compatible
 // Fixes: auth bypass, startup DDoS, silent stream failures, memory leaks, Express 5 deprecations
-// Added fix to "SharedWorker is not defined"
-if (typeof globalThis !== 'undefined' && typeof globalThis.SharedWorker === 'undefined') {
-  globalThis.SharedWorker = class SharedWorker {
-    constructor() {
-      this.port = {
-        start: () => {},
-        postMessage: () => {},
-        onmessage: null,
-        addEventListener: () => {},
-        removeEventListener: () => {},
-      };
-    }
-  };
-}
 
 const express = require('express');
 const cors = require('cors');
