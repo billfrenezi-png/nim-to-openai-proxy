@@ -30,19 +30,46 @@ const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
 if (SHOW_REASONING) console.log('[CONFIG] Reasoning display: ENABLED');
 if (ENABLE_THINKING_MODE) console.log('[CONFIG] Thinking mode: ENABLED');
 
+//FASTCRWSUPPORT
+ const FASTCRW_API_BASE =
+  process.env.FASTCRW_API_BASE || 'https://api.fastcrw.com';
+
+const FASTCRW_API_KEY = process.env.FASTCRW_API_KEY;
+const ENABLE_WEB_SEARCH = process.env.ENABLE_WEB_SEARCH === 'true';
+
+const MAX_TOOL_ROUNDS = Math.min(
+  Math.max(parseInt(process.env.MAX_TOOL_ROUNDS || '3', 10), 1),
+  5
+);
+
+const FASTCRW_TIMEOUT_MS = 30000;
 // ─── Config validation ──────────────────────────────────────────────────────
 
 function validateConfig() {
-  const fatal = (msg) => { console.error(`[FATAL] ${msg}`); process.exit(1); };
-  
-  if (!NIM_API_KEY) fatal('NIM_API_KEY is required. Get one at https://build.nvidia.com/');
-  
+  const fatal = (msg) => {
+    console.error(`[FATAL] ${msg}`);
+    process.exit(1);
+  };
+
+  if (!NIM_API_KEY) {
+    fatal('NIM_API_KEY is required. Get one at https://build.nvidia.com/');
+  }
+
   if (!CLIENT_AUTH_KEY) {
-    console.warn('[WARN] CLIENT_AUTH_KEY not set. All requests will be rejected with 403.');
+    console.warn(
+      '[WARN] CLIENT_AUTH_KEY not set. All requests will be rejected with 403.'
+    );
+  }
+
+  if (ENABLE_WEB_SEARCH && !FASTCRW_API_KEY) {
+    fatal('FASTCRW_API_KEY is required when ENABLE_WEB_SEARCH=true');
+  }
+
+  if (ENABLE_WEB_SEARCH) {
+    console.log('[CONFIG] Live web search: ENABLED');
+    console.log(`[CONFIG] fastCRW: ${FASTCRW_API_BASE}`);
   }
 }
-
-validateConfig();
 
 // ─── Model Mapping ─────────────────────────────────────────────────────────
 
@@ -216,6 +243,37 @@ function safeWrite(res, data) {
 }
 
 // ─── Routes ────────────────────────────────────────────────────────────────
+const FASTCRW_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'search_web',
+      description:
+        'Search the live web for current information. Use this when the user asks about recent events, current prices, current software/library information, news, recent releases, current people/companies, or anything where up-to-date web information would improve accuracy. Do not use it for ordinary timeless questions unless web verification is useful.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            description: 'The web search query.'
+          },
+          limit: {
+            type: 'integer',
+            description: 'Number of results to return. Maximum 8.',
+            minimum: 1,
+            maximum: 8
+          },
+          time_range: {
+            type: 'string',
+            enum: ['hour', 'day', 'week', 'month', 'year', 'any'],
+            description: 'Optional freshness filter.'
+          }
+        },
+        required: ['query']
+      }
+    }
+  }
+];
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', version: '2.1.0' });
@@ -234,9 +292,6 @@ app.get('/v1/models', (req, res) => {
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
-  let streamEndedCleanly = false;
-  let upstreamStream = null;
-
   try {
     const {
       model,
@@ -246,260 +301,284 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream
     } = req.body;
 
-const selectedModel =
-  MODEL_MAPPING[model] || 'nvidia/llama-3.3-nemotron-super-49b-v1.5';
-
-const requestBody = {
-  model: selectedModel,
-  messages,
-  temperature: temperature ?? 0.7,
-  max_tokens: Math.min(max_tokens ?? 2048, MAX_TOKENS_LIMIT),
-  stream: stream || false,
-  extra_body: ENABLE_THINKING_MODE
-    ? { chat_template_kwargs: { thinking: true } }
-    : undefined
-};
-
-const response = await axios.post(
-  `${NIM_API_BASE}/chat/completions`,
-  requestBody,
-  {
-    headers: {
-      Authorization: `Bearer ${NIM_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    responseType: stream ? "stream" : "json",
-    timeout: REQUEST_TIMEOUT_MS
-  }
-);
-
-upstreamStream = response.data;
-console.log("[PROXY] Model:", selectedModel);
-
-    if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-
-      const decoder = new StringDecoder('utf8');
-      let buffer = '';
-      let reasoningOpen = false;
-      let doneSent = false;
-      let cleanedUp = false;
-
-      const cleanup = () => {
-        if (cleanedUp) return;
-        cleanedUp = true;
-        if (upstreamStream) {
-          upstreamStream.removeAllListeners();
-        }
-        req.removeAllListeners('close');
-      };
-
-      const processLine = (line) => {
-        if (!line.startsWith('data: ')) return;
-
-        if (line.includes('[DONE]')) {
-          if (!doneSent) {
-            safeWrite(res, 'data: [DONE]\n\n');
-            doneSent = true;
-          }
-          streamEndedCleanly = true;
-          return;
-        }
-
-        try {
-          const data = JSON.parse(line.slice(6));
-          const delta = data.choices?.[0]?.delta;
-
-          if (delta) {
-            let content = delta.content || '';
-            const reasoning = delta.reasoning_content;
-
-            if (SHOW_REASONING) {
-              if (reasoning && !reasoningOpen) {
-                content = `<thinking>\n${reasoning.replace(/\n/g, '\\n')}`;
-                reasoningOpen = true;
-              } else if (reasoning) {
-                content = reasoning.replace(/\n/g, '\\n');
-              }
-
-              if (delta.content && reasoningOpen) {
-                content += `\n</thinking>\n\n${delta.content}`;
-                reasoningOpen = false;
-              }
-            }
-
-            delta.content = content;
-            delete delta.reasoning_content;
-          }
-
-          safeWrite(res, `data: ${JSON.stringify(data)}\n\n`);
-
-        } catch (parseErr) {
-          // FIX: Don't silently swallow—send error to client so they know data was lost
-          console.warn('[STREAM] Invalid JSON line:', line.slice(0, 100));
-          safeWrite(res, `data: ${JSON.stringify({ 
-            error: { 
-              message: 'Upstream sent malformed chunk', 
-              type: 'stream_parse_error',
-              details: line.slice(0, 100)
-            } 
-          })}\n\n`);
-        }
-      };
-
-      upstreamStream.on('data', chunk => {
-        buffer += decoder.write(chunk);
-
-        if (buffer.length > MAX_BUFFER_SIZE) {
-          console.error('[STREAM] Buffer overflow, destroying connection');
-          safeWrite(res, `data: ${JSON.stringify({ 
-            error: { 
-              message: 'Stream buffer overflow', 
-              type: 'stream_error' 
-            } 
-          })}\n\n`);
-          safeWrite(res, 'data: [DONE]\n\n');
-          res.end();
-          upstreamStream.destroy();
-          cleanup();
-          return;
-        }
-
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          processLine(line);
+    if (!Array.isArray(messages)) {
+      return res.status(400).json({
+        error: {
+          message: 'messages must be an array',
+          type: 'invalid_request_error',
+          code: 400
         }
       });
+    }
 
-      upstreamStream.on('end', () => {
-        buffer += decoder.end();
+    const selectedModel =
+      MODEL_MAPPING[model] ||
+      'nvidia/llama-3.3-nemotron-super-49b-v1.5';
 
-        if (buffer.trim()) {
-          for (const line of buffer.split('\n')) {
-            processLine(line);
-          }
-        }
+    console.log(
+      `[PROXY] ${model || 'default'} → ${selectedModel}`
+    );
 
-        if (!doneSent) {
-          safeWrite(res, 'data: [DONE]\n\n');
-        }
+    let nimResponse;
 
-        streamEndedCleanly = true;
-        if (!res.writableEnded) {
-          res.end();
-        }
-        cleanup();
+    if (ENABLE_WEB_SEARCH) {
+      nimResponse = await runWithWebSearch({
+        selectedModel,
+        messages,
+        temperature,
+        max_tokens
       });
-
-      upstreamStream.on('error', err => {
-        console.error('[STREAM] Upstream error:', err.message);
-        
-        if (!res.writableEnded) {
-          safeWrite(res, `data: ${JSON.stringify({
-            error: {
-              message: 'Stream interrupted by upstream error',
-              type: 'stream_error'
-            }
-          })}\n\n`);
-          safeWrite(res, 'data: [DONE]\n\n');
-          res.end();
-        }
-        cleanup();
-      });
-
-      // FIX: Check req.destroyed (Node/Express 5) 
-      // Don't destroy already-finished streams
-      req.on('close', () => {
-        const clientGone = req.destroyed || !res.writable;
-        
-        if (!streamEndedCleanly && clientGone) {
-          console.warn('[STREAM] Client disconnected prematurely');
-        }
-
-        if (upstreamStream && !upstreamStream.destroyed && !streamEndedCleanly) {
-          upstreamStream.destroy();
-        }
-        cleanup();
-      });
-
     } else {
-      // Non-streaming response
-      const openaiResponse = {
-        id: `chatcmpl-${Date.now()}`,
-        object: 'chat.completion',
-        created: Math.floor(Date.now() / 1000),
-        model: model,
-        choices: (response.data.choices || []).map((choice, i) => {
-          let content = choice.message?.content || '';
+      const requestBody = {
+        model: selectedModel,
+        messages,
+        temperature: temperature ?? 0.7,
+        max_tokens: Math.min(
+          max_tokens ?? 2048,
+          MAX_TOKENS_LIMIT
+        ),
+        stream: false,
 
-          if (SHOW_REASONING && choice.message?.reasoning_content) {
-            const safeReasoning = choice.message.reasoning_content.replace(/\n/g, '\\n');
-            content = `<thinking>\n${safeReasoning}\n</thinking>\n\n${content}`;
+        extra_body: ENABLE_THINKING_MODE
+          ? {
+              chat_template_kwargs: {
+                thinking: true
+              }
+            }
+          : undefined
+      };
+
+      const response = await axios.post(
+        `${NIM_API_BASE}/chat/completions`,
+        requestBody,
+        {
+          headers: {
+            Authorization: `Bearer ${NIM_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: REQUEST_TIMEOUT_MS
+        }
+      );
+
+      nimResponse = response.data;
+    }
+
+    /*
+     * Normalize NIM response into your proxy's OpenAI-compatible shape.
+     */
+    const openaiResponse = {
+      id:
+        nimResponse.id ||
+        `chatcmpl-${Date.now()}`,
+
+      object: 'chat.completion',
+
+      created:
+        nimResponse.created ||
+        Math.floor(Date.now() / 1000),
+
+      model: model || selectedModel,
+
+      choices: (nimResponse.choices || []).map(
+        (choice, i) => {
+          let content =
+            choice.message?.content || '';
+
+          if (
+            SHOW_REASONING &&
+            choice.message?.reasoning_content
+          ) {
+            const safeReasoning =
+              choice.message.reasoning_content
+                .replace(/\n/g, '\\n');
+
+            content =
+              `<thinking>\n${safeReasoning}\n</thinking>\n\n${content}`;
           }
 
           return {
             index: i,
+
             message: {
-              role: choice.message?.role || 'assistant',
+              role:
+                choice.message?.role ||
+                'assistant',
+
               content,
-              tool_calls: choice.message?.tool_calls
+
+              tool_calls:
+                choice.message?.tool_calls
             },
-            finish_reason: choice.finish_reason || 'stop'
+
+            finish_reason:
+              choice.finish_reason ||
+              'stop'
           };
-        }),
-        usage: response.data.usage || {
+        }
+      ),
+
+      usage:
+        nimResponse.usage || {
           prompt_tokens: 0,
           completion_tokens: 0,
           total_tokens: 0
         }
-      };
+    };
 
-      res.json(openaiResponse);
+    /*
+     * Normal JSON response.
+     */
+    if (!stream) {
+      return res.json(openaiResponse);
     }
 
-  } catch (error) {
-    console.error('[PROXY] Fatal error:', error.message);
-    console.error('[PROXY] NIM response:', error.response?.data);
+    /*
+     * Streaming compatibility.
+     *
+     * The tool loop itself runs internally first. Once the final
+     * answer is available, expose it as normal OpenAI SSE chunks.
+     */
+    res.setHeader(
+      'Content-Type',
+      'text/event-stream'
+    );
 
-    if (!res.headersSent) {
-      res.status(error.response?.status || 500).json({
-        error: {
-          message: error.message,
-          type: 'invalid_request_error',
-          code: error.response?.status || 500
-        }
-      });
-    } else if (!res.writableEnded) {
-      safeWrite(res, `data: ${JSON.stringify({
-        error: {
-          message: error.message,
-          type: 'proxy_error'
-        }
-      })}\n\n`);
-      safeWrite(res, 'data: [DONE]\n\n');
+    res.setHeader(
+      'Cache-Control',
+      'no-cache'
+    );
+
+    res.setHeader(
+      'Connection',
+      'keep-alive'
+    );
+
+    const choice =
+      openaiResponse.choices?.[0];
+
+    const content =
+      choice?.message?.content || '';
+
+    const chunkId = openaiResponse.id;
+
+    /*
+     * Initial role chunk.
+     */
+    safeWrite(
+      res,
+      `data: ${JSON.stringify({
+        id: chunkId,
+        object: 'chat.completion.chunk',
+        created: openaiResponse.created,
+        model: openaiResponse.model,
+        choices: [
+          {
+            index: 0,
+            delta: {
+              role: 'assistant'
+            },
+            finish_reason: null
+          }
+        ]
+      })}\n\n`
+    );
+
+    /*
+     * Send final content.
+     */
+    if (content) {
+      safeWrite(
+        res,
+        `data: ${JSON.stringify({
+          id: chunkId,
+          object: 'chat.completion.chunk',
+          created: openaiResponse.created,
+          model: openaiResponse.model,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                content
+              },
+              finish_reason: null
+            }
+          ]
+        })}\n\n`
+      );
+    }
+
+    /*
+     * Finish.
+     */
+    safeWrite(
+      res,
+      `data: ${JSON.stringify({
+        id: chunkId,
+        object: 'chat.completion.chunk',
+        created: openaiResponse.created,
+        model: openaiResponse.model,
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            finish_reason:
+              choice?.finish_reason || 'stop'
+          }
+        ]
+      })}\n\n`
+    );
+
+    safeWrite(res, 'data: [DONE]\n\n');
+
+    if (!res.writableEnded) {
       res.end();
     }
 
-    // Clean up upstream stream if we have it
-    if (upstreamStream && !upstreamStream.destroyed) {
-      upstreamStream.destroy();
+  } catch (error) {
+    console.error(
+      '[PROXY] Fatal error:',
+      error.message
+    );
+
+    if (error.response?.data) {
+      console.error(
+        '[PROXY] Upstream response:',
+        error.response.data
+      );
+    }
+
+    if (!res.headersSent) {
+      return res.status(
+        error.response?.status || 500
+      ).json({
+        error: {
+          message: error.message,
+          type: 'proxy_error',
+          code:
+            error.response?.status || 500
+        }
+      });
+    }
+
+    if (!res.writableEnded) {
+      safeWrite(
+        res,
+        `data: ${JSON.stringify({
+          error: {
+            message: error.message,
+            type: 'proxy_error'
+          }
+        })}\n\n`
+      );
+
+      safeWrite(
+        res,
+        'data: [DONE]\n\n'
+      );
+
+      res.end();
     }
   }
-});
-
-// FIX: Express 5 named wildcard — but use proper 404 handler
-app.use((req, res) => {
-  res.status(404).json({
-    error: {
-      message: `Endpoint ${req.method} ${req.path} not found`,
-      type: 'invalid_request_error',
-      code: 404
-    }
-  });
 });
 
 // ─── Startup ───────────────────────────────────────────────────────────────
@@ -514,77 +593,212 @@ app.listen(PORT, () => {
   });
 });
 
-// ─── Tavily Support ───────────────────────────────────────────────────────────────
+// ─── FASTCRWSUPPORTB ───────────────────────────────────────────────────────────────
 
-app.post("/chat", async (req, res) => {
-  try {
+async function searchFastCRW(args) {
+  if (!FASTCRW_API_KEY) {
+    throw new Error('FASTCRW_API_KEY is not configured');
+  }
+
+  const query = String(args?.query || '').trim();
+
+  if (!query) {
+    throw new Error('search_web requires a non-empty query');
+  }
+
+  if (query.length > 1000) {
+    throw new Error('Search query is too long');
+  }
+
+  const limit = Math.min(
+    Math.max(Number(args?.limit) || 5, 1),
+    8
+  );
+
+  const timeRangeMap = {
+    hour: 'qdr:h',
+    day: 'qdr:d',
+    week: 'qdr:w',
+    month: 'qdr:m',
+    year: 'qdr:y'
+  };
+
+  const body = {
+    query,
+    limit,
+    sources: ['web']
+  };
+
+  if (args?.time_range && timeRangeMap[args.time_range]) {
+    body.tbs = timeRangeMap[args.time_range];
+  }
+
+  console.log(
+    `[FASTCRW] Searching: "${query}" (limit=${limit})`
+  );
+
+  const response = await axios.post(
+    `${FASTCRW_API_BASE}/v1/search`,
+    body,
+    {
+      headers: {
+        Authorization: `Bearer ${FASTCRW_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: FASTCRW_TIMEOUT_MS
+    }
+  );
+
+  const results = Array.isArray(response.data?.data)
+    ? response.data.data
+    : [];
+
+  return {
+    success: true,
+    query,
+    results: results.map((r, index) => ({
+      position: r.position ?? index + 1,
+      title: r.title || '',
+      url: r.url || '',
+      description: r.description || '',
+      snippet: r.snippet || '',
+      score: r.score ?? null,
+      publishedDate: r.publishedDate ?? null
+    }))
+  };
+}
+
+
+async function runWithWebSearch({
+  selectedModel,
+  messages,
+  temperature,
+  max_tokens
+}) {
+  const workingMessages = Array.isArray(messages)
+    ? messages.map(m => ({ ...m }))
+    : [];
+
+  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    const requestBody = {
+      model: selectedModel,
+      messages: workingMessages,
+      temperature: temperature ?? 0.7,
+      max_tokens: Math.min(
+        max_tokens ?? 2048,
+        MAX_TOKENS_LIMIT
+      ),
+      stream: false,
+
+      tools: FASTCRW_TOOLS,
+      tool_choice: 'auto',
+      parallel_tool_calls: false,
+
+      extra_body: ENABLE_THINKING_MODE
+        ? {
+            chat_template_kwargs: {
+              thinking: true
+            }
+          }
+        : undefined
+    };
+
     const response = await axios.post(
       `${NIM_API_BASE}/chat/completions`,
       requestBody,
       {
         headers: {
           Authorization: `Bearer ${NIM_API_KEY}`,
+          'Content-Type': 'application/json'
         },
+        timeout: REQUEST_TIMEOUT_MS
       }
     );
 
-    const choice = response.data.choices[0];
+    const choice = response.data?.choices?.[0];
+    const assistantMessage = choice?.message;
 
-    if (choice.message?.tool_calls?.length) {
-      messages.push(choice.message);
+    if (!assistantMessage) {
+      throw new Error('NIM returned no assistant message');
+    }
 
-      for (const toolCall of choice.message.tool_calls) {
-        if (toolCall.function?.name !== "tavily_search") continue;
+    const toolCalls = assistantMessage.tool_calls || [];
 
-        let args = {};
+    // Model has finished answering.
+    if (toolCalls.length === 0) {
+      return response.data;
+    }
 
-        try {
-          args = JSON.parse(toolCall.function.arguments || "{}");
-        } catch {
-          args = {};
-        }
+    // Preserve the assistant tool-call message exactly.
+    workingMessages.push({
+      role: 'assistant',
+      content: assistantMessage.content || null,
+      tool_calls: toolCalls
+    });
 
-        let result;
+    for (const toolCall of toolCalls) {
+      const toolName = toolCall.function?.name;
 
-        try {
-          result = await tavilySearch({
-            query: args.query,
-            search_depth: args.search_depth ?? "basic",
-            max_results: Math.min(args.max_results ?? 5, 10),
-            include_answer: true,
-            include_raw_content: false,
-            include_images: false,
-          });
-        } catch (e) {
-          result = {
-            error: "Search failed",
-            message: e.message,
-          };
-        }
-
-        messages.push({
-          role: "tool",
+      if (toolName !== 'search_web') {
+        workingMessages.push({
+          role: 'tool',
           tool_call_id: toolCall.id,
-          content: JSON.stringify(result),
+          content: JSON.stringify({
+            success: false,
+            error: `Unknown tool: ${toolName}`
+          })
         });
+
+        continue;
       }
 
-      const final = await axios.post(
-        `${NIM_API_BASE}/chat/completions`,
-        {
-          model: selectedModel,
-          messages,
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${NIM_API_KEY}`,
-          },
-        }
-      );
+      let args;
 
-      return res.json(final.data);
+      try {
+        args = JSON.parse(
+          toolCall.function?.arguments || '{}'
+        );
+      } catch {
+        workingMessages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: JSON.stringify({
+            success: false,
+            error: 'Invalid JSON arguments supplied to search_web'
+          })
+        });
+
+        continue;
+      }
+
+      try {
+        const result = await searchFastCRW(args);
+
+        workingMessages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: JSON.stringify(result)
+        });
+      } catch (error) {
+        console.error(
+          '[FASTCRW] Search failed:',
+          error.message
+        );
+
+        workingMessages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: JSON.stringify({
+            success: false,
+            error: 'Live web search failed',
+            details: error.message
+          })
+        });
+      }
     }
-  } catch (err) {
-    // existing error handling
   }
-});
+
+  throw new Error(
+    `Web search tool loop exceeded ${MAX_TOOL_ROUNDS} rounds`
+  );
+}
