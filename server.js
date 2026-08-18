@@ -348,10 +348,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           : undefined
       };
 
-async function postNimWithRetry(requestBody, maxRetries = 3) {
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await axios.post(
+      const response = await axios.post(
         `${NIM_API_BASE}/chat/completions`,
         requestBody,
         {
@@ -362,28 +359,7 @@ async function postNimWithRetry(requestBody, maxRetries = 3) {
           timeout: REQUEST_TIMEOUT_MS
         }
       );
-    } catch (error) {
-      const status = error.response?.status;
 
-      if (status !== 429 || attempt === maxRetries) {
-        throw error;
-      }
-
-      const retryAfter = Number(error.response?.headers?.['retry-after']);
-
-      const delay = Number.isFinite(retryAfter)
-        ? retryAfter * 1000
-        : Math.min(1000 * 2 ** attempt, 8000);
-
-      console.warn(
-        `[NIM] 429 received. Retrying in ${delay}ms ` +
-        `(attempt ${attempt + 1}/${maxRetries})`
-      );
-
-      await new Promise(resolve => setTimeout(resolve, delay));
-    }
-  }
-}
       nimResponse = response.data;
     }
 
