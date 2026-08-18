@@ -99,7 +99,6 @@ const MODEL_MAPPING = {
   'step-3.5-flash': 'stepfun-ai/step-3.5-flash',
   'step-3.7-flash': 'stepfun-ai/step-3.7-flash'
 };
-
 // ─── Middleware ─────────────────────────────────────────────────────────────
 
 app.use(cors());
@@ -276,7 +275,7 @@ const FASTCRW_TOOLS = [
 ];
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '2.1.0' });
+  res.json({ status: 'ok', version: '2.2.0' });
 });
 
 app.get('/v1/models', (req, res) => {
