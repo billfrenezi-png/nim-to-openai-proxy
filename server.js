@@ -835,7 +835,6 @@ if (!primaryModel) {
   });
 }
 
-let finalMessages = messages;
 let webSearchUsed = false;
 
 // ─── Automatic Web Search ───────────────────────────────────────────────
@@ -1035,10 +1034,8 @@ const { response, model: usedModel } = await callModel(
 const lines = buffer.split('\n');
 buffer = lines.pop() || '';
 
-
-const MAX_LINE_SIZE = 256 * 1024;
         
-        if (buffer.length > MAX_LINE_SIZE) {
+        if (buffer.length > MAX_BUFFER_SIZE) {
           console.error('[STREAM] Buffer overflow, destroying connection');
           safeWrite(res, `data: ${JSON.stringify({
             error: {
@@ -1232,179 +1229,3 @@ app.listen(PORT, () => {
     console.error('[VALIDATION] Startup check failed:', err.message);
   });
 });
-
-
-//—— JudgeSearchman ——————————————————————————————————————————————————————————
-
-async function shouldSearchWeb(messages, model) {
-  const recentMessages = messages
-    .slice(-6)
-    .map(m => `${m.role}: ${m.content}`)
-    .join('\n');
-    .filter(m => m.role === 'user' || m.role === 'assistant')
-}
-  const decision = await shouldSearchWeb(
-  getSearchableMessages(messages),
-  primaryModel
-);
-
-  const routerRequest = {
-    model,
-    messages: [
-      {
-        role: 'system',
-        content: `
-You are a web-search routing classifier.
-
-Determine whether answering the user's latest request would materially
-benefit from CURRENT or EXTERNAL web information.
-
-Search when the user asks for things such as:
-- current/latest/recent information
-- news
-- today's information
-- live prices, scores, weather, availability or schedules
-- current software/library/API information
-- current company/person information
-- facts that should be verified against the web
-- specific websites, articles, pages, documentation, or sources
-- information that may have changed since your training
-
-
-Do NOT search for:
-- creative writing
-- casual conversation
-- rewriting
-- summarization of text the user already supplied
-- general stable knowledge
-- coding questions that can be answered without current documentation
-
-Return ONLY valid JSON:
-
-{
-  "search": true|false,
-  "query": "best concise web search query",
-  "reason": "short explanation"
-}
-
-If searching is unnecessary, query must be "".
-`
-      },
-      {
-        role: 'user',
-        content: recentMessages
-      }
-    ],
-    temperature: 0,
-    max_tokens: 300,
-    stream: false
-  };
-
-  try {
-    const response = await axios.post(
-      `${NIM_API_BASE}/chat/completions`,
-      routerRequest,
-      {
-        headers: {
-          Authorization: `Bearer ${NIM_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        timeout: 10000
-      }
-    );
-
-    const text =
-      response.data?.choices?.[0]?.message?.content || '';
-
-    // Handle accidental markdown fences
-    const cleaned = text
-      .replace(/^```json\s*/i, '')
-      .replace(/^```\s*/i, '')
-      .replace(/\s*```$/i, '')
-      .trim();
-
-    const decision = JSON.parse(cleaned);
-
-    return {
-      search: decision.search === true,
-      query: typeof decision.query === 'string'
-        ? decision.query.trim()
-        : '',
-      reason: decision.reason || ''
-    };
-
-  } catch (err) {
-    console.warn(
-      '[SEARCH ROUTER] Failed:',
-      err.response?.data || err.message
-    );
-
-    // Fail closed.
-    return {
-      search: false,
-      query: '',
-      reason: 'router_failed'
-    };
-  }
-}
-
-
-
-const SEARCH_CACHE = new Map();
-
-const SEARCH_CACHE_TTL_MS =
-  Number(process.env.SEARCH_CACHE_TTL_MS || 60_000);
-
-function normalizeSearchKey(query) {
-  return query
-    .toLowerCase()
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-async function cachedSearchWeb(query, options = {}) {
-  const key = normalizeSearchKey(query);
-
-  const cached = SEARCH_CACHE.get(key);
-
-  if (cached && cached.expires > Date.now()) {
-    return cached.results;
-  }
-
-  const results = await searchWeb(query, options);
-
-  SEARCH_CACHE.set(key, {
-    results,
-    expires: Date.now() + SEARCH_CACHE_TTL_MS
-  });
-
-  // Prevent unlimited memory growth.
-  if (SEARCH_CACHE.size > 500) {
-    const oldest = SEARCH_CACHE.keys().next().value;
-    SEARCH_CACHE.delete(oldest);
-  }
-
-  return results;
-}
-
-const results = await cachedSearchWeb(decision.query);
-
-const ttl =
-  queryLooksLikeNews(query) ? 30_000 :
-  queryLooksLikePrice(query) ? 15_000 :
-  120_000;
-
-
-if (stream) {
-  res.status(200);
-
-  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('Connection', 'keep-alive');
-
-  if (typeof res.flushHeaders === 'function') {
-    res.flushHeaders();
-  }
-}
-
-safeWrite(res, ': connected\n\n');
