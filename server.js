@@ -22,7 +22,7 @@ const ENABLE_THINKING_MODE = process.env.ENABLE_THINKING_MODE === 'true';
 const SKIP_VALIDATION = process.env.SKIP_VALIDATION === 'true';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
-const MAX_TOKENS_LIMIT = 95536;
+const MAX_TOKENS_LIMIT = 65536;
 const REQUEST_TIMEOUT_MS = 180000;
 const VALIDATION_TIMEOUT_MS = 15000;
 const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
@@ -348,7 +348,10 @@ app.post('/v1/chat/completions', async (req, res) => {
           : undefined
       };
 
-      const response = await axios.post(
+async function postNimWithRetry(requestBody, maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await axios.post(
         `${NIM_API_BASE}/chat/completions`,
         requestBody,
         {
@@ -359,7 +362,28 @@ app.post('/v1/chat/completions', async (req, res) => {
           timeout: REQUEST_TIMEOUT_MS
         }
       );
+    } catch (error) {
+      const status = error.response?.status;
 
+      if (status !== 429 || attempt === maxRetries) {
+        throw error;
+      }
+
+      const retryAfter = Number(error.response?.headers?.['retry-after']);
+
+      const delay = Number.isFinite(retryAfter)
+        ? retryAfter * 1000
+        : Math.min(1000 * 2 ** attempt, 8000);
+
+      console.warn(
+        `[NIM] 429 received. Retrying in ${delay}ms ` +
+        `(attempt ${attempt + 1}/${maxRetries})`
+      );
+
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+}
       nimResponse = response.data;
     }
 
