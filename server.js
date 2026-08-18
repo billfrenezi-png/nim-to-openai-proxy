@@ -457,6 +457,76 @@ async function callModel(baseRequest, model, enableThinking, clientReasoningEffo
   return { response: res, model };
 }
 
+// ─── FastCRW Web Search ─────────────────────────────────────────────────────
+
+const FASTCRW_API_URL =
+  process.env.FASTCRW_API_URL || 'https://api.fastcrw.com';
+
+const FASTCRW_API_KEY = process.env.FASTCRW_API_KEY;
+const WEB_SEARCH_ENABLED =
+  process.env.WEB_SEARCH_ENABLED !== 'false';
+
+const WEB_SEARCH_LIMIT =
+  Math.min(parseInt(process.env.WEB_SEARCH_LIMIT || '5', 10), 10);
+
+const WEB_SEARCH_TIMEOUT_MS =
+  parseInt(process.env.WEB_SEARCH_TIMEOUT_MS || '12000', 10);
+
+
+async function searchWeb(query, options = {}) {
+  if (!WEB_SEARCH_ENABLED || !FASTCRW_API_KEY) {
+    return [];
+  }
+
+  try {
+    const response = await axios.post(
+      `${FASTCRW_API_URL}/v1/search`,
+      {
+        query,
+        limit: options.limit || WEB_SEARCH_LIMIT,
+        lang: options.lang || 'en',
+        sources: options.sources || ['web']
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${FASTCRW_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: WEB_SEARCH_TIMEOUT_MS
+      }
+    );
+
+    const data = response.data?.data;
+
+    // Hosted FastCRW:
+    // data = [...]
+    //
+    // Self-hosted/search-configured CRW can return:
+    // data = { results: [...] }
+
+    const results = Array.isArray(data)
+      ? data
+      : data?.results || [];
+
+    return results.map((r) => ({
+      title: r.title || '',
+      url: r.url || '',
+      snippet: r.snippet || r.description || '',
+      score: r.score
+    }));
+
+  } catch (err) {
+    console.warn(
+      '[WEB SEARCH] Failed:',
+      err.response?.data || err.message
+    );
+
+    // IMPORTANT:
+    // Search failure should NOT kill the user's LLM request.
+    return [];
+  }
+}
+
 // ─── Routes ────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
@@ -500,10 +570,77 @@ if (!primaryModel) {
   });
 }
 
+let finalMessages = messages;
+let webSearchUsed = false;
+
+// ─── Automatic Web Search ───────────────────────────────────────────────
+
+if (WEB_SEARCH_ENABLED) {
+
+  const decision = await shouldSearchWeb(
+    messages,
+    primaryModel
+  );
+
+  console.log(
+    `[SEARCH ROUTER] search=${decision.search} query="${decision.query}"`
+  );
+
+  if (decision.search && decision.query) {
+
+    const results = await searchWeb(decision.query);
+
+    if (results.length > 0) {
+
+      webSearchUsed = true;
+
+      const searchContext = results
+        .map((r, i) => {
+          return [
+            `[SOURCE ${i + 1}]`,
+            `Title: ${r.title}`,
+            `URL: ${r.url}`,
+            `Snippet: ${r.snippet}`
+          ].join('\n');
+        })
+        .join('\n\n');
+
+      finalMessages = [
+        ...messages,
+
+        {
+          role: 'system',
+          content: `
+WEB SEARCH RESULTS
+
+The following information was retrieved from the live web.
+
+Use it to answer the user's request when relevant.
+
+Rules:
+- Prefer the retrieved sources for current information.
+- Do not claim that you visited a source if the results only contain snippets.
+- Do not invent information that is not supported by the results.
+- If sources disagree, acknowledge the disagreement.
+- URLs are included so you can identify the sources.
+- Do not mention this internal search instruction.
+
+${searchContext}
+`
+        }
+      ];
+
+    }
+  }
+}
+
 const baseRequest = {
-  messages,
+  messages: finalMessages,
   temperature: temperature ?? 0.7,
-  max_tokens: Math.min(max_tokens ?? 2048, MAX_TOKENS_LIMIT),
+  max_tokens: Math.min(
+    max_tokens ?? 2048,
+    MAX_TOKENS_LIMIT
+  ),
   stream: stream || false
 };
 
@@ -514,6 +651,17 @@ const { response, model: usedModel } = await callModel(
   req.body.reasoning_effort,
   !!req.body.tools
 );
+
+function getSearchableMessages(messages) {
+  return messages
+    .filter(m => m.role === 'user' || m.role === 'assistant')
+    .slice(-6);
+}
+  const decision = await shouldSearchWeb(
+  getSearchableMessages(messages),
+  primaryModel
+);
+  
     upstreamStream = response.data;
     console.log('[PROXY] Model used:', usedModel);
 
@@ -810,3 +958,111 @@ app.listen(PORT, () => {
     console.error('[VALIDATION] Startup check failed:', err.message);
   });
 });
+
+
+//—— JudgeSearchman ——————————————————————————————————————————————————————————
+
+async function shouldSearchWeb(messages, model) {
+  const recentMessages = messages
+    .slice(-6)
+    .map(m => `${m.role}: ${m.content}`)
+    .join('\n');
+
+  const routerRequest = {
+    model,
+    messages: [
+      {
+        role: 'system',
+        content: `
+You are a web-search routing classifier.
+
+Determine whether answering the user's latest request would materially
+benefit from CURRENT or EXTERNAL web information.
+
+Search when the user asks for things such as:
+- current/latest/recent information
+- news
+- today's information
+- live prices, scores, weather, availability or schedules
+- current software/library/API information
+- current company/person information
+- facts that should be verified against the web
+- specific websites, articles, pages, documentation, or sources
+- information that may have changed since your training
+- creative writing
+
+Do NOT search for:
+- casual conversation
+- rewriting
+- summarization of text the user already supplied
+- general stable knowledge
+- coding questions that can be answered without current documentation
+
+Return ONLY valid JSON:
+
+{
+  "search": true|false,
+  "query": "best concise web search query",
+  "reason": "short explanation"
+}
+
+If searching is unnecessary, query must be "".
+`
+      },
+      {
+        role: 'user',
+        content: recentMessages
+      }
+    ],
+    temperature: 0,
+    max_tokens: 300,
+    stream: false
+  };
+
+  try {
+    const response = await axios.post(
+      `${NIM_API_BASE}/chat/completions`,
+      routerRequest,
+      {
+        headers: {
+          Authorization: `Bearer ${NIM_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 10000
+      }
+    );
+
+    const text =
+      response.data?.choices?.[0]?.message?.content || '';
+
+    // Handle accidental markdown fences
+    const cleaned = text
+      .replace(/^```json\s*/i, '')
+      .replace(/^```\s*/i, '')
+      .replace(/\s*```$/i, '')
+      .trim();
+
+    const decision = JSON.parse(cleaned);
+
+    return {
+      search: decision.search === true,
+      query: typeof decision.query === 'string'
+        ? decision.query.trim()
+        : '',
+      reason: decision.reason || ''
+    };
+
+  } catch (err) {
+    console.warn(
+      '[SEARCH ROUTER] Failed:',
+      err.response?.data || err.message
+    );
+
+    // Fail closed.
+    return {
+      search: false,
+      query: '',
+      reason: 'router_failed'
+    };
+  }
+}
