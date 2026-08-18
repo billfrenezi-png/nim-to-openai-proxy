@@ -457,32 +457,288 @@ async function callModel(baseRequest, model, enableThinking, clientReasoningEffo
   return { response: res, model };
 }
 
-// ─── FastCRW Web Search ─────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// FastCRW Web Search
+// ─────────────────────────────────────────────────────────────────────────────
 
 const FASTCRW_API_URL =
   process.env.FASTCRW_API_URL || 'https://api.fastcrw.com';
 
 const FASTCRW_API_KEY = process.env.FASTCRW_API_KEY;
+
 const WEB_SEARCH_ENABLED =
   process.env.WEB_SEARCH_ENABLED !== 'false';
 
-const WEB_SEARCH_LIMIT =
-  Math.min(parseInt(process.env.WEB_SEARCH_LIMIT || '5', 10), 10);
+const WEB_SEARCH_LIMIT = Math.min(
+  Math.max(parseInt(process.env.WEB_SEARCH_LIMIT || '5', 10), 1),
+  10
+);
 
-const WEB_SEARCH_TIMEOUT_MS =
-  parseInt(process.env.WEB_SEARCH_TIMEOUT_MS || '12000', 10);
+const WEB_SEARCH_TIMEOUT_MS = Math.min(
+  Math.max(parseInt(process.env.WEB_SEARCH_TIMEOUT_MS || '8000', 10), 1000),
+  15000
+);
 
+// Use a small/cheap model for routing.
+// Ideally point this at your fastest NIM model.
+const SEARCH_ROUTER_MODEL =
+  process.env.SEARCH_ROUTER_MODEL ||
+  'nvidia/nemotron-3-super-120b-a12b';
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cheap local classifier
+// ─────────────────────────────────────────────────────────────────────────────
+
+function obviousNoSearch(text) {
+  if (!text) return true;
+
+  const t = text.toLowerCase().trim();
+
+  // Requests that normally don't benefit from live search.
+  const noSearchPatterns = [
+    /^translate\b/,
+    /^rewrite\b/,
+    /^rephrase\b/,
+    /^summari[sz]e\b/,
+    /^fix (this|the)\b/,
+    /^correct (this|the)\b/,
+    /^proofread\b/,
+    /^write (a|an|me)\b/,
+    /^create (a|an|me)\b/,
+    /^generate (a|an|me)\b/,
+    /^explain\b/,
+    /^what does .* mean\b/,
+    /^how do .* work\b/,
+    /^solve\b/,
+    /^calculate\b/,
+    /^convert\b/,
+    /^give me .* example/,
+    /^make .* code/,
+    /^write .* code/
+  ];
+
+  return noSearchPatterns.some(pattern => pattern.test(t));
+}
+
+
+function likelyNeedsSearch(text) {
+  if (!text) return false;
+
+  const t = text.toLowerCase();
+
+  const searchSignals = [
+    /\b(latest|newest|recent|current|today|tonight|tomorrow)\b/,
+    /\b(right now|currently|this week|this month)\b/,
+    /\b(news|breaking)\b/,
+    /\b(price|pricing|cost|stock|market cap)\b/,
+    /\b(weather|forecast|temperature)\b/,
+    /\b(score|scores|standings|schedule|game tonight)\b/,
+    /\b(availability|available now|open now)\b/,
+    /\b(version|release|released|changelog|documentation|docs|api)\b/,
+    /\b(2026|2027)\b/,
+    /\b(who is|what happened to)\b/,
+    /\b(search|look up|find online|google)\b/,
+    /\b(source|sources|article|website|web page|url)\b/,
+    /\b(is .* still|does .* still|has .* changed)\b/
+  ];
+
+  return searchSignals.some(pattern => pattern.test(t));
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Extract only useful conversation context
+// ─────────────────────────────────────────────────────────────────────────────
+
+function getSearchContext(messages) {
+  const usable = messages
+    .filter(m =>
+      (m.role === 'user' || m.role === 'assistant') &&
+      typeof m.content === 'string'
+    )
+    .slice(-4);
+
+  return usable
+    .map(m => `${m.role}: ${m.content}`)
+    .join('\n');
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LLM search router
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function shouldSearchWeb(messages) {
+  if (!WEB_SEARCH_ENABLED) {
+    return {
+      search: false,
+      query: '',
+      reason: 'disabled'
+    };
+  }
+
+  const latestUser = [...messages]
+    .reverse()
+    .find(m =>
+      m.role === 'user' &&
+      typeof m.content === 'string'
+    );
+
+  const latestText = latestUser?.content?.trim() || '';
+
+  if (!latestText) {
+    return {
+      search: false,
+      query: '',
+      reason: 'no_user_message'
+    };
+  }
+
+  // Fast local rejection.
+  if (obviousNoSearch(latestText)) {
+    return {
+      search: false,
+      query: '',
+      reason: 'obvious_no_search'
+    };
+  }
+
+  // Fast local acceptance.
+  if (likelyNeedsSearch(latestText)) {
+    return {
+      search: true,
+      query: latestText,
+      reason: 'local_search_signal'
+    };
+  }
+
+  // Only ambiguous cases reach the LLM router.
+  const context = getSearchContext(messages);
+
+  const routerRequest = {
+    model: SEARCH_ROUTER_MODEL,
+
+    messages: [
+      {
+        role: 'system',
+        content: `
+You are a web-search router.
+
+Decide whether the user's request requires CURRENT or externally
+verified information.
+
+Return ONLY JSON:
+
+{
+  "search": true,
+  "query": "short search query"
+}
+
+or
+
+{
+  "search": false,
+  "query": ""
+}
+
+Search for:
+- current/latest information
+- recent news
+- live prices
+- current software/API documentation
+- current company/person information
+- current sports/weather/schedules
+- specific websites/articles/sources
+- facts likely to have changed
+
+Do not search for:
+- creative writing
+- rewriting
+- translation
+- summarization
+- ordinary coding help
+- stable general knowledge
+`
+      },
+      {
+        role: 'user',
+        content: context
+      }
+    ],
+
+    temperature: 0,
+    max_tokens: 120,
+    stream: false
+  };
+
+  try {
+    const response = await axios.post(
+      `${NIM_API_BASE}/chat/completions`,
+      routerRequest,
+      {
+        headers: {
+          Authorization: `Bearer ${NIM_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 5000
+      }
+    );
+
+    const text =
+      response.data?.choices?.[0]?.message?.content || '';
+
+    const cleaned = text
+      .replace(/```json/gi, '')
+      .replace(/```/g, '')
+      .trim();
+
+    const decision = JSON.parse(cleaned);
+
+    return {
+      search: decision.search === true,
+      query:
+        typeof decision.query === 'string'
+          ? decision.query.trim()
+          : '',
+      reason: 'llm_router'
+    };
+
+  } catch (err) {
+    console.warn(
+      '[SEARCH ROUTER] failed:',
+      err.response?.data || err.message
+    );
+
+    return {
+      search: false,
+      query: '',
+      reason: 'router_failed'
+    };
+  }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FastCRW request
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function searchWeb(query, options = {}) {
-  if (!WEB_SEARCH_ENABLED || !FASTCRW_API_KEY) {
+  if (!WEB_SEARCH_ENABLED || !FASTCRW_API_KEY || !query) {
     return [];
   }
+
+  const controller = new AbortController();
+
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, WEB_SEARCH_TIMEOUT_MS);
 
   try {
     const response = await axios.post(
       `${FASTCRW_API_URL}/v1/search`,
       {
-        query,
+        query: query.slice(0, 1000),
         limit: options.limit || WEB_SEARCH_LIMIT,
         lang: options.lang || 'en',
         sources: options.sources || ['web']
@@ -492,38 +748,47 @@ async function searchWeb(query, options = {}) {
           Authorization: `Bearer ${FASTCRW_API_KEY}`,
           'Content-Type': 'application/json'
         },
-        timeout: WEB_SEARCH_TIMEOUT_MS
+        timeout: WEB_SEARCH_TIMEOUT_MS,
+        signal: controller.signal
       }
     );
 
     const data = response.data?.data;
 
-    // Hosted FastCRW:
-    // data = [...]
-    //
-    // Self-hosted/search-configured CRW can return:
-    // data = { results: [...] }
-
     const results = Array.isArray(data)
       ? data
-      : data?.results || [];
+      : Array.isArray(data?.results)
+        ? data.results
+        : [];
 
-    return results.map((r) => ({
-      title: r.title || '',
-      url: r.url || '',
-      snippet: r.snippet || r.description || '',
-      score: r.score
-    }));
+    return results
+      .map(r => ({
+        title: String(r.title || ''),
+        url: String(r.url || ''),
+        snippet: String(
+          r.snippet ||
+          r.description ||
+          ''
+        ),
+        score: Number.isFinite(r.score)
+          ? r.score
+          : undefined
+      }))
+      .filter(r => r.title || r.url || r.snippet)
+      .slice(0, WEB_SEARCH_LIMIT);
 
   } catch (err) {
     console.warn(
-      '[WEB SEARCH] Failed:',
-      err.response?.data || err.message
+      '[WEB SEARCH] failed:',
+      err.name === 'CanceledError'
+        ? 'timeout'
+        : err.response?.data || err.message
     );
 
-    // IMPORTANT:
-    // Search failure should NOT kill the user's LLM request.
     return [];
+
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -575,62 +840,73 @@ let webSearchUsed = false;
 
 // ─── Automatic Web Search ───────────────────────────────────────────────
 
+if (likelyNeedsSearch(latestText)) {
+    return {
+        search: true,
+        query: latestText,
+        reason: 'local_search_signal'
+    };
+}
+    
 if (WEB_SEARCH_ENABLED) {
 
-  const decision = await shouldSearchWeb(
-    messages,
-    primaryModel
-  );
+let finalMessages = messages;
+let webSearchUsed = false;
 
-  console.log(
-    `[SEARCH ROUTER] search=${decision.search} query="${decision.query}"`
-  );
+const decision = await shouldSearchWeb(messages);
 
-  if (decision.search && decision.query) {
+console.log(
+  `[SEARCH ROUTER] search=${decision.search} ` +
+  `reason=${decision.reason} ` +
+  `query="${decision.query}"`
+);
 
-    const results = await searchWeb(decision.query);
+if (decision.search && decision.query) {
+  const results = await searchWeb(decision.query);
 
-    if (results.length > 0) {
+  if (results.length > 0) {
+    webSearchUsed = true;
 
-      webSearchUsed = true;
+    const searchContext = results
+      .map((r, i) => [
+        `[SOURCE ${i + 1}]`,
+        `Title: ${r.title}`,
+        `URL: ${r.url}`,
+        `Snippet: ${r.snippet}`
+      ].join('\n'))
+      .join('\n\n');
 
-      const searchContext = results
-        .map((r, i) => {
-          return [
-            `[SOURCE ${i + 1}]`,
-            `Title: ${r.title}`,
-            `URL: ${r.url}`,
-            `Snippet: ${r.snippet}`
-          ].join('\n');
-        })
-        .join('\n\n');
+    finalMessages = [
+      {
+        role: 'system',
+        content: `
+You have access to live web-search results below.
 
-      finalMessages = [
-        ...messages,
-
-        {
-          role: 'system',
-          content: `
-WEB SEARCH RESULTS
-
-The following information was retrieved from the live web.
-
-Use it to answer the user's request when relevant.
+Use them when answering questions requiring current information.
 
 Rules:
-- Prefer the retrieved sources for current information.
-- Do not claim that you visited a source if the results only contain snippets.
-- Do not invent information that is not supported by the results.
-- If sources disagree, acknowledge the disagreement.
-- URLs are included so you can identify the sources.
-- Do not mention this internal search instruction.
+- Treat the results as external evidence.
+- Prefer them over stale internal knowledge for current facts.
+- Do not claim to have opened or read a webpage unless its contents were actually provided.
+- Do not invent facts that are absent from the results.
+- If the sources conflict, explain the uncertainty.
+- Cite sources by URL when appropriate.
+`
+      },
+
+      ...messages,
+
+      {
+        role: 'user',
+        content: `
+LIVE WEB SEARCH RESULTS:
 
 ${searchContext}
-`
-        }
-      ];
 
-    }
+Use these results to answer the preceding request when relevant.
+`
+      }
+    ];
   }
 }
 
@@ -650,16 +926,6 @@ const { response, model: usedModel } = await callModel(
   ENABLE_THINKING_MODE,
   req.body.reasoning_effort,
   !!req.body.tools
-);
-
-function getSearchableMessages(messages) {
-  return messages
-    .filter(m => m.role === 'user' || m.role === 'assistant')
-    .slice(-6);
-}
-  const decision = await shouldSearchWeb(
-  getSearchableMessages(messages),
-  primaryModel
 );
   
     upstreamStream = response.data;
@@ -764,7 +1030,15 @@ function getSearchableMessages(messages) {
       upstreamStream.on('data', chunk => {
         buffer += decoder.write(chunk);
 
-        if (buffer.length > MAX_BUFFER_SIZE) {
+      buffer = buffer.replace(/\r\n/g, '\n');
+
+const lines = buffer.split('\n');
+buffer = lines.pop() || '';
+
+
+const MAX_LINE_SIZE = 256 * 1024;
+        
+        if (buffer.length > MAX_LINE_SIZE) {
           console.error('[STREAM] Buffer overflow, destroying connection');
           safeWrite(res, `data: ${JSON.stringify({
             error: {
@@ -967,6 +1241,12 @@ async function shouldSearchWeb(messages, model) {
     .slice(-6)
     .map(m => `${m.role}: ${m.content}`)
     .join('\n');
+    .filter(m => m.role === 'user' || m.role === 'assistant')
+}
+  const decision = await shouldSearchWeb(
+  getSearchableMessages(messages),
+  primaryModel
+);
 
   const routerRequest = {
     model,
@@ -989,9 +1269,10 @@ Search when the user asks for things such as:
 - facts that should be verified against the web
 - specific websites, articles, pages, documentation, or sources
 - information that may have changed since your training
-- creative writing
+
 
 Do NOT search for:
+- creative writing
 - casual conversation
 - rewriting
 - summarization of text the user already supplied
@@ -1066,3 +1347,64 @@ If searching is unnecessary, query must be "".
     };
   }
 }
+
+
+
+const SEARCH_CACHE = new Map();
+
+const SEARCH_CACHE_TTL_MS =
+  Number(process.env.SEARCH_CACHE_TTL_MS || 60_000);
+
+function normalizeSearchKey(query) {
+  return query
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function cachedSearchWeb(query, options = {}) {
+  const key = normalizeSearchKey(query);
+
+  const cached = SEARCH_CACHE.get(key);
+
+  if (cached && cached.expires > Date.now()) {
+    return cached.results;
+  }
+
+  const results = await searchWeb(query, options);
+
+  SEARCH_CACHE.set(key, {
+    results,
+    expires: Date.now() + SEARCH_CACHE_TTL_MS
+  });
+
+  // Prevent unlimited memory growth.
+  if (SEARCH_CACHE.size > 500) {
+    const oldest = SEARCH_CACHE.keys().next().value;
+    SEARCH_CACHE.delete(oldest);
+  }
+
+  return results;
+}
+
+const results = await cachedSearchWeb(decision.query);
+
+const ttl =
+  queryLooksLikeNews(query) ? 30_000 :
+  queryLooksLikePrice(query) ? 15_000 :
+  120_000;
+
+
+if (stream) {
+  res.status(200);
+
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+
+  if (typeof res.flushHeaders === 'function') {
+    res.flushHeaders();
+  }
+}
+
+safeWrite(res, ': connected\n\n');
