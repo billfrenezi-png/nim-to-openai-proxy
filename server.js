@@ -855,70 +855,6 @@ upstreamStream.on('data', chunk => {
     // Determine if the client wants legacy inline <thinking> tags in the content stream
     const inlineReasoning = req.headers['x-reasoning-format'] === 'inline';
 
-    if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-
-      const decoder = new StringDecoder('utf8');
-      let buffer = '';
-      let reasoningOpen = false;
-      let doneSent = false;
-      let cleanedUp = false;
-
-      const normalizer = new StreamNormalizer(usedModel);
-
-      const cleanup = () => {
-        if (cleanedUp) return;
-        cleanedUp = true;
-        if (upstreamStream) {
-          upstreamStream.removeAllListeners();
-        }
-        req.removeAllListeners('close');
-      };
-
-      const processLine = (line) => {
-        if (!line.startsWith('data: ')) return;
-
-        if (line.includes('[DONE]')) {
-          if (!doneSent) {
-            safeWrite(res, 'data: [DONE]\n\n');
-            doneSent = true;
-          }
-          streamEndedCleanly = true;
-          return;
-        }
-
-        try {
-          const data = JSON.parse(line.slice(6));
-          const delta = data.choices?.[0]?.delta;
-
-          if (delta) {
-            const normalizedDelta = normalizer.processDelta(delta);
-            let clientContent = '';
-
-            if (SHOW_REASONING && inlineReasoning) {
-              // Legacy GoonChat behavior: bake <thinking> tags into content
-              if (normalizedDelta.reasoning && !reasoningOpen) {
-                clientContent += `<thinking>\n${normalizedDelta.reasoning}`;
-                reasoningOpen = true;
-              } else if (normalizedDelta.reasoning) {
-                clientContent += normalizedDelta.reasoning;
-              }
-
-              if (normalizedDelta.content && reasoningOpen) {
-                clientContent += `\n</thinking>\n\n${normalizedDelta.content}`;
-                reasoningOpen = false;
-              } else if (normalizedDelta.content) {
-                clientContent += normalizedDelta.content;
-              }
-            } else {
-              // Default behavior: clean content, no inline tags
-              clientContent = normalizedDelta.content || '';
-            }
-
-            delta.content = clientContent;
-
             // FIX: keep a structured reasoning field alongside the inline
             // tags in content. GoonChat parses the inline tags;
             // clients like Pal Chat / OpenRouter-style apps look for a
@@ -1238,7 +1174,7 @@ async function runWithWebSearch({
         max_tokens ?? 2048,
         MAX_TOKENS_LIMIT
       ),
-      stream: stream || false,
+      stream: false,
 
       tools: FASTCRW_TOOLS,
       tool_choice: 'auto',
@@ -1330,29 +1266,29 @@ async function runWithWebSearch({
           tool_call_id: toolCall.id,
           content: JSON.stringify(result)
         });
-      }
-      catch (error) {
+      } catch (error) {
+       console.error(
+        '[FASTCRW] Search failed:',
+        error.response?.status || 'unknown',
+        error.message
+       );
+       
+       if (error.response?.data) {
         console.error(
-         '[FASTCRW] Search failed:',
-         error.response?.status || 'unknown',
-         error.message
+         '[FASTCRW] Upstream response:',
+         error.response.data
         );
-      }
-if (error.response?.data) {
-  console.error(
-    '[FASTCRW] Upstream response:',
-    error.response.data
-  );
-}
-        workingMessages.push({
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          content: JSON.stringify({
-            success: false,
-            error: 'Live web search failed',
-            details: error.message
-          })
-        });
+       }
+       
+       workingMessages.push({
+        role: 'tool',
+        tool_call_id: toolCall.id,
+        content: JSON.stringify({
+         success: false,
+         error: 'Live web search failed',
+         details: error.message
+        })
+       });
       }
     }
   }
