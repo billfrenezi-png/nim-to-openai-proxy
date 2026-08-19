@@ -242,6 +242,46 @@ function safeWrite(res, data) {
   return false;
 }
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function postNIM(requestBody) {
+  const MAX_RETRIES = 3;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await axios.post(
+        `${NIM_API_BASE}/chat/completions`,
+        requestBody,
+        {
+          headers: {
+            Authorization: `Bearer ${NIM_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: REQUEST_TIMEOUT_MS
+        }
+      );
+    } catch (error) {
+      const status = error.response?.status;
+
+      if (status !== 429 || attempt === MAX_RETRIES) {
+        throw error;
+      }
+
+      const delay =
+        Math.min(1000 * Math.pow(2, attempt), 15000) +
+        Math.floor(Math.random() * 500);
+
+      console.warn(
+        `[NIM] 429 rate limit. Retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`
+      );
+
+      await sleep(delay);
+    }
+  }
+}
+
 // ─── Routes ────────────────────────────────────────────────────────────────
 const FASTCRW_TOOLS = [
   {
@@ -249,7 +289,24 @@ const FASTCRW_TOOLS = [
     function: {
       name: 'search_web',
       description:
-        'Search the live web for current information. Use this when the user asks about recent events, current prices, current software/library information, news, recent releases, current people/companies, or anything where up-to-date web information would improve accuracy. Do not use it for ordinary timeless questions unless web verification is useful.',
+        'Search the live web only when current or externally verifiable information is actually needed.
+
+Use search for:
+- current real-world facts
+- recent events or news
+- current public figures
+- current products, games, movies, shows, companies, or software
+- factual details that the supplied conversation/context does not contain
+
+Do NOT search for:
+- creative writing
+- roleplay
+- fictional continuation
+- brainstorming
+- ordinary conversation
+- information already present in the conversation
+
+When searching, prefer a single focused search with 2-3 results.',
       parameters: {
         type: 'object',
         properties: {
@@ -259,7 +316,7 @@ const FASTCRW_TOOLS = [
           },
           limit: {
             type: 'integer',
-            description: 'Number of results to return. Maximum 8.',
+            description: 'Number of results to return. Prefer 2-3 for normal questions. Maximum 5.',
             minimum: 1,
             maximum: 8
           },
@@ -348,17 +405,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           : undefined
       };
 
-      const response = await axios.post(
-        `${NIM_API_BASE}/chat/completions`,
-        requestBody,
-        {
-          headers: {
-            Authorization: `Bearer ${NIM_API_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          timeout: REQUEST_TIMEOUT_MS
-        }
-      );
+      const response = await postNIM(requestBody);
 
       nimResponse = response.data;
     }
@@ -611,8 +658,8 @@ async function searchFastCRW(args) {
   }
 
   const limit = Math.min(
-    Math.max(Number(args?.limit) || 5, 1),
-    8
+    Math.max(Number(args?.limit) || 3, 1),
+    5
   );
 
   const timeRangeMap = {
@@ -657,14 +704,10 @@ async function searchFastCRW(args) {
     success: true,
     query,
     results: results.map((r, index) => ({
-      position: r.position ?? index + 1,
-      title: r.title || '',
-      url: r.url || '',
-      description: r.description || '',
-      snippet: r.snippet || '',
-      score: r.score ?? null,
-      publishedDate: r.publishedDate ?? null
-    }))
+     title: r.title || '',
+     url: r.url || '',
+     snippet: r.snippet || ''
+   }))
   };
 }
 
