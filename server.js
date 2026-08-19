@@ -704,10 +704,10 @@ async function searchFastCRW(args) {
     success: true,
     query,
     results: results.map((r, index) => ({
-     title: r.title || '',
-     url: r.url || '',
-     snippet: r.snippet || ''
-   }))
+      title: r.title || '',
+      url: r.url || '',
+      snippet: r.snippet || ''
+    }))
   };
 }
 
