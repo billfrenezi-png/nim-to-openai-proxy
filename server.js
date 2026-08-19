@@ -777,7 +777,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.end();
     }
 
-  } catch (error) {
+  }
+   catch (error) {
     console.error(
       '[PROXY] Fatal error:',
       error.message
@@ -1095,7 +1096,8 @@ upstreamStream.on('data', chunk => {
       res.json(openaiResponse);
     }
 
-  } catch (error) {
+  } 
+   catch (error) {
     console.error('[PROXY] Fatal error:', error.message);
     console.error('[PROXY] NIM response:', error.response?.data);
 
@@ -1329,7 +1331,8 @@ async function runWithWebSearch({
           tool_call_id: toolCall.id,
           content: JSON.stringify(result)
         });
-      } catch (error) {
+      }
+      catch (error) {
         console.error(
          '[FASTCRW] Search failed:',
          error.response?.status || 'unknown',
