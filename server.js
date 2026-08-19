@@ -90,69 +90,6 @@ const FASTCRW_MAX_TOKENS = Math.min(
 
 const FASTCRW_TIMEOUT_MS = 30000;
 
-
-// ─── FASTCRW Tool Definition ────────────────────────────────────────────────
-
-const FASTCRW_TOOLS = [
-  {
-    type: 'function',
-
-    function: {
-      name: 'search_web',
-
-      description:
-        'Use this tool sparingly and only when the answer genuinely requires external web information. ' +
-        'Do NOT search merely because a topic is interesting, potentially current, or something you could answer from the conversation or general knowledge. ' +
-        'Do NOT search for creative writing, roleplay, fictional continuation, brainstorming, casual conversation, opinions, or requests that can be answered from the supplied context. ' +
-        'Before searching, determine whether web information is actually necessary. ' +
-        'When a search is necessary, make ONE focused search query that directly answers the missing information. ' +
-        'Do not perform multiple searches to explore the same question. ' +
-        'After receiving search results, use them to answer the user rather than automatically searching again.',
-
-      parameters: {
-        type: 'object',
-
-        properties: {
-          query: {
-            type: 'string',
-
-            description:
-              'One focused web search query for information that is genuinely missing from the conversation.'
-          },
-
-          limit: {
-            type: 'integer',
-
-            description:
-              'Number of results to return. Prefer 2-3. Do not request more unless genuinely necessary.',
-
-            minimum: 1,
-            maximum: 5
-          },
-
-          time_range: {
-            type: 'string',
-
-            enum: [
-              'hour',
-              'day',
-              'week',
-              'month',
-              'year',
-              'any'
-            ],
-
-            description:
-              'Optional freshness filter. Use only when freshness actually matters.'
-          }
-        },
-
-        required: ['query']
-      }
-    }
-  }
-];
-
 // ─── Configuration Validation ───────────────────────────────────────────────
 
 function validateConfig() {
@@ -1032,7 +969,13 @@ const FASTCRW_TOOLS = [
       name: 'search_web',
 
       description:
-        'Search the live web only when current or externally verifiable information is actually needed. Use search for current real-world facts, recent events or news, current public figures, current products, games, movies, shows, companies, software, or factual details that the supplied conversation does not contain. Do NOT search for creative writing, roleplay, fictional continuation, brainstorming, ordinary conversation, or information already present in the conversation. When searching, prefer a single focused search with 2-3 results.',
+        'Use this tool sparingly and only when the answer genuinely requires external web information. ' +
+        'Do NOT search merely because a topic is interesting, potentially current, or something you could answer from the conversation or general knowledge. ' +
+        'Do NOT search for creative writing, roleplay, fictional continuation, brainstorming, casual conversation, opinions, or requests that can be answered from the supplied context. ' +
+        'Before searching, determine whether web information is actually necessary. ' +
+        'When a search is necessary, make ONE focused search query that directly answers the missing information. ' +
+        'Do not perform multiple searches to explore the same question. ' +
+        'After receiving search results, use them to answer the user rather than automatically searching again.',
 
       parameters: {
         type: 'object',
@@ -1040,20 +983,24 @@ const FASTCRW_TOOLS = [
         properties: {
           query: {
             type: 'string',
+
             description:
-              'The web search query.'
+              'One focused web search query for information that is genuinely missing from the conversation.'
           },
 
           limit: {
             type: 'integer',
+
             description:
-              'Number of results to return. Prefer 2-3 for normal questions. Maximum 8.',
+              'Number of results to return. Prefer 2-3. Do not request more unless genuinely necessary.',
+
             minimum: 1,
-            maximum: 8
+            maximum: 5
           },
 
           time_range: {
             type: 'string',
+
             enum: [
               'hour',
               'day',
@@ -1062,8 +1009,9 @@ const FASTCRW_TOOLS = [
               'year',
               'any'
             ],
+
             description:
-              'Optional freshness filter.'
+              'Optional freshness filter. Use only when freshness actually matters.'
           }
         },
 
@@ -1152,6 +1100,14 @@ async function runWithWebSearch({
         }))
       : [];
 
+  // Track searches performed during this logical request.
+  //
+  // This prevents GLM from asking for the same search again with
+  // slightly different tool arguments.
+  const searchedQueries = new Set();
+
+  let searchPerformed = false;
+
   for (
     let round = 0;
     round < MAX_TOOL_ROUNDS;
@@ -1176,8 +1132,8 @@ async function runWithWebSearch({
 
       max_tokens:
         Math.min(
-          max_tokens ?? 2048,
-          MAX_TOKENS_LIMIT
+          max_tokens ?? FASTCRW_MAX_TOKENS,
+          FASTCRW_MAX_TOKENS
         ),
 
       stream: false,
@@ -1188,6 +1144,13 @@ async function runWithWebSearch({
 
       ...reasoningPayload
     };
+
+    // If we've already searched, this is the last chance for the model
+    // to produce its answer. Do not let it initiate another search.
+    if (searchPerformed) {
+      delete requestBody.tools;
+      delete requestBody.tool_choice;
+    }
 
     const response =
       await postNIM(
@@ -1203,9 +1166,9 @@ async function runWithWebSearch({
     }
 
     const toolCalls =
-      assistantMessage.tool_calls ||
-      [];
+      assistantMessage.tool_calls || [];
 
+    // Normal answer: we're done.
     if (
       !Array.isArray(toolCalls) ||
       toolCalls.length === 0
@@ -1213,16 +1176,19 @@ async function runWithWebSearch({
       return response.data;
     }
 
+    // We explicitly append the assistant's tool-call message
+    // before returning tool results.
     workingMessages.push(
       assistantMessage
     );
+
+    let searchCallsThisRound = 0;
 
     for (
       const toolCall of toolCalls
     ) {
       if (
-        toolCall.type !==
-        'function'
+        toolCall.type !== 'function'
       ) {
         continue;
       }
@@ -1231,8 +1197,7 @@ async function runWithWebSearch({
         toolCall.function?.name;
 
       if (
-        functionName !==
-        'search_web'
+        functionName !== 'search_web'
       ) {
         workingMessages.push({
           role: 'tool',
@@ -1243,8 +1208,35 @@ async function runWithWebSearch({
           content:
             JSON.stringify({
               success: false,
+
               error:
                 `Unknown tool: ${functionName}`
+            })
+        });
+
+        continue;
+      }
+
+      // ─────────────────────────────────────────
+      // Search budget
+      // ─────────────────────────────────────────
+
+      if (
+        searchCallsThisRound >=
+        MAX_SEARCH_CALLS_PER_ROUND
+      ) {
+        workingMessages.push({
+          role: 'tool',
+
+          tool_call_id:
+            toolCall.id,
+
+          content:
+            JSON.stringify({
+              success: false,
+
+              error:
+                'Search budget exhausted for this round. Use the information already available and answer the user.'
             })
         });
 
@@ -1268,6 +1260,7 @@ async function runWithWebSearch({
           content:
             JSON.stringify({
               success: false,
+
               error:
                 'Invalid tool arguments'
             })
@@ -1282,8 +1275,14 @@ async function runWithWebSearch({
         ).trim();
 
       const limit =
-        Number(
-          args.limit || 3
+        Math.min(
+          Math.max(
+            Number(
+              args.limit || 3
+            ),
+            1
+          ),
+          5
         );
 
       const timeRange =
@@ -1300,13 +1299,56 @@ async function runWithWebSearch({
           content:
             JSON.stringify({
               success: false,
+
               error:
-                'Search query is empty'
+                'Search query is empty. Answer using the available context instead.'
             })
         });
 
         continue;
       }
+
+      // ─────────────────────────────────────────
+      // Duplicate search protection
+      // ─────────────────────────────────────────
+
+      const normalizedQuery =
+        query
+          .toLowerCase()
+          .replace(/\s+/g, ' ')
+          .trim();
+
+      const searchKey =
+        `${normalizedQuery}|${timeRange}`;
+
+      if (
+        searchedQueries.has(searchKey)
+      ) {
+        console.warn(
+          `[FASTCRW] Duplicate search suppressed: ${query}`
+        );
+
+        workingMessages.push({
+          role: 'tool',
+
+          tool_call_id:
+            toolCall.id,
+
+          content:
+            JSON.stringify({
+              success: false,
+
+              error:
+                'This search has already been performed during this request. Use the existing search results instead of searching again.'
+            })
+        });
+
+        continue;
+      }
+
+      searchedQueries.add(searchKey);
+      searchCallsThisRound++;
+      searchPerformed = true;
 
       console.log(
         `[FASTCRW] Searching: ${query}`
@@ -1332,6 +1374,11 @@ async function runWithWebSearch({
             )
         });
       } catch (error) {
+        console.error(
+          '[FASTCRW] Search failed:',
+          error.message
+        );
+
         workingMessages.push({
           role: 'tool',
 
@@ -1343,7 +1390,7 @@ async function runWithWebSearch({
               success: false,
 
               error:
-                'Live web search failed',
+                'Live web search failed.',
 
               details:
                 error.message
@@ -1351,11 +1398,60 @@ async function runWithWebSearch({
         });
       }
     }
+
+    // ─────────────────────────────────────────
+    // Important:
+    //
+    // Once a search has happened, don't give certain models
+    // another opportunity to start a fresh search
+    // in the next round.
+    //
+    // The next iteration is therefore synthesis-only.
+    // ─────────────────────────────────────────
+
+    if (searchPerformed) {
+      const finalReasoningPayload =
+        getReasoningPayload(
+          selectedModel,
+          enableThinking,
+          reasoningEffort,
+          false
+        );
+
+      const finalResponse =
+        await postNIM({
+          model: selectedModel,
+
+          messages:
+            workingMessages,
+
+          temperature:
+            temperature ?? 0.7,
+
+          max_tokens:
+            Math.min(
+              max_tokens ?? FASTCRW_MAX_TOKENS,
+              FASTCRW_MAX_TOKENS
+            ),
+
+          stream: false,
+
+          // Deliberately omit tools here.
+          ...finalReasoningPayload
+        });
+
+      return finalResponse.data;
+    }
   }
 
-  // If the model keeps asking for tools,
-  // make one final normal completion
-  // without tools.
+  // ─────────────────────────────────────────
+  // Safety fallback
+  //
+  // If MAX_TOOL_ROUNDS is reached without
+  // producing a final answer, make one final
+  // tool-free completion.
+  // ─────────────────────────────────────────
+
   const finalReasoningPayload =
     getReasoningPayload(
       selectedModel,
@@ -1376,8 +1472,8 @@ async function runWithWebSearch({
 
       max_tokens:
         Math.min(
-          max_tokens ?? 2048,
-          MAX_TOKENS_LIMIT
+          max_tokens ?? FASTCRW_MAX_TOKENS,
+          FASTCRW_MAX_TOKENS
         ),
 
       stream: false,
