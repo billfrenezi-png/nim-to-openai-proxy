@@ -187,15 +187,6 @@ const MODEL_MAPPING = {
     'stepfun-ai/step-3.7-flash'
 };
 
-// ─── Fallback Models ─────────────────────────────────────────────────────────
-
-const FALLBACK_MODELS = [
-  'mistralai/mistral-medium-3.5-128b',
-  'mistralai/mistral-small-4-119b-2603',
-  'nvidia/llama-3.3-nemotron-super-49b-v1.5',
-  'google/gemma-4-31b-it'
-];
-
 // ─── Reasoning Subsystem ────────────────────────────────────────────────────
 
 class DelimiterParser {
@@ -1328,7 +1319,7 @@ async function runWithWebSearch({
 
 // ─── Fallback Completion ─────────────────────────────────────────────────────
 
-async function callWithFallback({
+async function callNIM({
   selectedModel,
   messages,
   temperature,
@@ -1338,102 +1329,52 @@ async function callWithFallback({
   reasoningEffort,
   hasTools
 }) {
-  const candidates = [
-    selectedModel,
-    ...FALLBACK_MODELS.filter(
-      model =>
-        model !== selectedModel
-    )
-  ];
-
-  let lastError = null;
-
-  for (
-    const model of candidates
-  ) {
-    try {
-      console.log(
-        `[NIM] Trying model: ${model}`
-      );
-
-      const reasoningPayload =
-        getReasoningPayload(
-          model,
-          enableThinking,
-          reasoningEffort,
-          hasTools
-        );
-
-      const requestBody = {
-        model,
-
-        messages,
-
-        temperature:
-          temperature ?? 0.7,
-
-        max_tokens:
-          Math.min(
-            max_tokens ?? 2048,
-            MAX_TOKENS_LIMIT
-          ),
-
-        stream:
-          Boolean(stream),
-
-        ...reasoningPayload
-      };
-
-      const response =
-        await postNIM(
-          requestBody,
-          stream
-            ? {
-                responseType:
-                  'stream'
-              }
-            : {}
-        );
-
-      return {
-        response,
-        usedModel: model
-      };
-    } catch (error) {
-      lastError = error;
-
-      console.error(
-        `[NIM] Model failed: ${model}`,
-        error.response?.status ||
-          error.message
-      );
-
-      const status =
-        error.response?.status;
-
-      // Only try the next model for
-      // errors that reasonably indicate
-      // the selected model cannot serve
-      // the request.
-      if (
-        status !== 400 &&
-        status !== 404 &&
-        status !== 422 &&
-        status !== 429 &&
-        status !== 500 &&
-        status !== 502 &&
-        status !== 503 &&
-        status !== 504
-      ) {
-        break;
-      }
-    }
-  }
-
-  throw lastError ||
-    new Error(
-      'All NIM models failed'
+  const reasoningPayload =
+    getReasoningPayload(
+      selectedModel,
+      enableThinking,
+      reasoningEffort,
+      hasTools
     );
+
+  const requestBody = {
+    model: selectedModel,
+
+    messages,
+
+    temperature:
+      temperature ?? 0.7,
+
+    max_tokens:
+      Math.min(
+        max_tokens ?? 2048,
+        MAX_TOKENS_LIMIT
+      ),
+
+    stream:
+      Boolean(stream),
+
+    ...reasoningPayload
+  };
+
+  console.log(
+    `[NIM] Using model: ${selectedModel}`
+  );
+
+  return {
+    response: await postNIM(
+      requestBody,
+      stream
+        ? {
+            responseType:
+              'stream'
+          }
+        : {}
+    ),
+
+    usedModel:
+      selectedModel
+  };
 }
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
@@ -1501,8 +1442,19 @@ app.post(
       }
 
       const selectedModel =
-        MODEL_MAPPING[model] ||
-        'nvidia/llama-3.3-nemotron-super-49b-v1.5';
+        MODEL_MAPPING[model];
+      
+      if (!selectedModel) {
+        return res.status(400).json({
+          error: {
+            message:
+              `Unknown model: ${model}`,
+            type:
+              'invalid_request_error',
+            code: 400
+          }
+        });
+      }
 
       console.log(
         `[PROXY] ${model || 'default'} → ${selectedModel}`
@@ -1748,7 +1700,7 @@ app.post(
       // ─────────────────────────────────────────
 
       const result =
-        await callWithFallback({
+        await callNIM({
           selectedModel,
           messages,
           temperature,
