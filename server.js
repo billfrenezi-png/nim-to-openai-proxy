@@ -17,7 +17,7 @@ const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.c
 const NIM_API_KEY = process.env.NIM_API_KEY;
 const CLIENT_AUTH_KEY = process.env.CLIENT_AUTH_KEY;
 
-const SHOW_REASONING = process.env.SHOW_REASONING === 'false';
+const SHOW_REASONING = process.env.SHOW_REASONING === 'true';
 const ENABLE_THINKING_MODE = process.env.ENABLE_THINKING_MODE === 'true';
 const SKIP_VALIDATION = process.env.SKIP_VALIDATION === 'true';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
@@ -46,13 +46,17 @@ const FASTCRW_TIMEOUT_MS = 30000;
 // ─── Config validation ──────────────────────────────────────────────────────
 
 function validateConfig() {
-  const fatal = (msg) => {
-    console.error(`[FATAL] ${msg}`);
-    process.exit(1);
-  };
+  const fatal = (msg) => { console.error(`[FATAL] ${msg}`); process.exit(1); };
 
-  if (!NIM_API_KEY) {
-    fatal('NIM_API_KEY is required. Get one at https://build.nvidia.com/');
+  if (!NIM_API_KEY) fatal('NIM_API_KEY is required. Get one at https://build.nvidia.com/');
+
+  if (!CLIENT_AUTH_KEY) {
+    console.warn('[WARN] CLIENT_AUTH_KEY not set. All requests will be rejected with 403.');
+  }
+}
+
+validateConfig();
+
   }
 
   if (!CLIENT_AUTH_KEY) {
@@ -100,7 +104,230 @@ const MODEL_MAPPING = {
   'step-3.7-flash': 'stepfun-ai/step-3.7-flash'
 };
 
-// ─── Middleware ─────────────────────────────────────────────────────────────
+// ─── Reasoning Subsystem ─────────────────────────────────────────────────────
+// Pure, stateful string parser for extracting reasoning blocks across chunks.
+
+class DelimiterParser {
+  constructor(openTag, closeTag) {
+    this.openTag = openTag;
+    this.closeTag = closeTag;
+    this.inThinking = false;
+    this.buffer = '';
+  }
+
+  processChunk(chunk) {
+    this.buffer += chunk;
+    let content = '';
+    let reasoning = '';
+
+    while (true) {
+      const targetTag = this.inThinking ? this.closeTag : this.openTag;
+      const tagIndex = this.buffer.indexOf(targetTag);
+
+      if (tagIndex !== -1) {
+        const textBefore = this.buffer.substring(0, tagIndex);
+        if (this.inThinking) {
+          reasoning += textBefore;
+        } else {
+          content += textBefore;
+        }
+        this.inThinking = !this.inThinking;
+        this.buffer = this.buffer.substring(tagIndex + targetTag.length);
+      } else {
+        // Check for partial tag at the end
+        let partialLen = 0;
+        const maxLen = Math.min(this.buffer.length, targetTag.length - 1);
+        for (let i = maxLen; i > 0; i--) {
+          if (targetTag.startsWith(this.buffer.substring(this.buffer.length - i))) {
+            partialLen = i;
+            break;
+          }
+        }
+
+        const textBefore = this.buffer.substring(0, this.buffer.length - partialLen);
+        if (this.inThinking) {
+          reasoning += textBefore;
+        } else {
+          content += textBefore;
+        }
+        this.buffer = this.buffer.substring(this.buffer.length - partialLen);
+        break;
+      }
+    }
+    return { content, reasoning };
+  }
+
+  flush() {
+    let content = '';
+    let reasoning = '';
+    if (this.buffer) {
+      if (this.inThinking) {
+        reasoning += this.buffer;
+      } else {
+        content += this.buffer;
+      }
+      this.buffer = '';
+    }
+    return { content, reasoning };
+  }
+}
+
+// Normalizes structured reasoning fields and extracts content delimiters.
+class StreamNormalizer {
+  constructor(model) {
+    this.model = model;
+    this.parser = null;
+
+    // ONLY use content delimiters for models that embed reasoning in content
+    if (model === 'qwen/qwen3.5-397b-a17b' || model === 'nvidia/llama-3.3-nemotron-super-49b-v1.5') {
+      this.parser = new DelimiterParser('<think>', '</think>');
+    }
+    // Models like Gemma 4, DeepSeek, GPT-OSS use structured fields and are NOT parsed here.
+  }
+
+  processDelta(delta) {
+    const normalizedDelta = { ...delta };
+    let reasoning = normalizedDelta.reasoning || normalizedDelta.reasoning_content || '';
+    let content = normalizedDelta.content || '';
+
+    // Priority: Structured reasoning > Content delimiters
+    if (!reasoning && content && this.parser) {
+      const parsed = this.parser.processChunk(content);
+      reasoning = parsed.reasoning;
+      content = parsed.content;
+    }
+
+    if (content) normalizedDelta.content = content;
+    else delete normalizedDelta.content;
+
+    if (reasoning) normalizedDelta.reasoning = reasoning;
+    else delete normalizedDelta.reasoning;
+
+    delete normalizedDelta.reasoning_content;
+    return normalizedDelta;
+  }
+
+  flush() {
+    if (!this.parser) return { content: '', reasoning: '' };
+    return this.parser.flush();
+  }
+}
+
+function normalizeNonStreamChoice(choice, model) {
+  if (!choice) return choice;
+
+  const message = choice.message || {};
+  let reasoning = message.reasoning || message.reasoning_content || '';
+  let content = message.content || '';
+
+  if (!reasoning && content) {
+    let parser = null;
+    if (model === 'qwen/qwen3.5-397b-a17b' || model === 'nvidia/llama-3.3-nemotron-super-49b-v1.5') {
+      parser = new DelimiterParser('<think>', '</think>');
+    }
+
+    if (parser) {
+      const parsed = parser.processChunk(content);
+      const flushed = parser.flush();
+      content = (parsed.content || '') + (flushed.content || '');
+      reasoning = (parsed.reasoning || '') + (flushed.reasoning || '');
+    }
+  }
+
+  const newMessage = { ...message };
+  if (content) newMessage.content = content;
+  if (reasoning) newMessage.reasoning = reasoning;
+  delete newMessage.reasoning_content;
+
+  return { ...choice, message: newMessage };
+}
+
+// Pure function returning model-specific reasoning request payloads.
+// IMPORTANT: everything returned here gets spread DIRECTLY into the top-level
+// JSON body sent to NIM via axios. Do NOT wrap anything in an `extra_body` key —
+// that's an openai-SDK-only convention this proxy doesn't use, and NIM's raw
+// REST endpoint will just silently ignore a field called "extra_body".
+function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools) {
+  const effort = clientReasoningEffort;
+
+  switch (model) {
+    case 'nvidia/nemotron-3-super-120b-a12b': {
+      if (!enableThinking) return {};
+      return { chat_template_kwargs: { enable_thinking: true } };
+    }
+
+    case 'nvidia/nemotron-3-ultra-550b-a55b': {
+      if (!enableThinking) return {};
+      const payload = { chat_template_kwargs: { enable_thinking: true } };
+      // Unverified param — see header comment. Left as opt-in best-effort.
+      if (hasTools) payload.chat_template_kwargs.force_nonempty_content = true;
+      return payload;
+    }
+
+    case 'qwen/qwen3.5-397b-a17b': {
+      // Model appears to default to thinking-on in its chat template. Only send
+      // a field when the caller explicitly wants thinking OFF; otherwise let the
+      // <think> delimiter parser handle whatever the model does natively.
+      if (enableThinking) return {};
+      return { chat_template_kwargs: { enable_thinking: false } };
+    }
+
+    case 'deepseek-ai/deepseek-v4-pro':
+    case 'deepseek-ai/deepseek-v4-flash': {
+      if (!enableThinking) return {};
+      const payload = { chat_template_kwargs: { thinking: true } };
+      if (effort) payload.chat_template_kwargs.reasoning_effort = effort;
+      return payload;
+    }
+
+    case 'openai/gpt-oss-120b':
+    case 'openai/gpt-oss-20b': {
+      if (effort && ['low', 'medium', 'high'].includes(effort)) {
+        return { reasoning_effort: effort };
+      }
+      if (enableThinking) return { reasoning_effort: 'high' };
+      return {};
+    }
+
+    case 'mistralai/mistral-medium-3.5-128b':
+    case 'mistralai/mistral-small-4-119b-2603': {
+      if (effort && ['high', 'none'].includes(effort)) {
+        return { reasoning_effort: effort };
+      }
+      if (enableThinking) return { reasoning_effort: 'high' };
+      return {};
+    }
+
+    case 'z-ai/glm-5.2': {
+      // FIX: GLM-5.2 thinks by default. `reasoning_effort` only controls
+      // intensity (max vs high) once thinking is already happening — it does
+      // NOT turn thinking off. The actual on/off switch is `thinking.type`.
+      // Without this, GLM-5.2 was silently reasoning on every single request
+      // regardless of ENABLE_THINKING_MODE.
+      const payload = {
+        thinking: { type: enableThinking ? 'enabled' : 'disabled' }
+      };
+      if (enableThinking && effort) payload.reasoning_effort = effort;
+      return payload;
+    }
+
+    case 'google/gemma-4-31b-it': {
+      if (!enableThinking) return {};
+      return { chat_template_kwargs: { enable_thinking: true } };
+    }
+
+    case 'stepfun-ai/step-3.7-flash': {
+      if (enableThinking) return {};
+      return { chat_template_kwargs: { thinking: false } };
+    }
+
+    default:
+      // Default reasoning models (Kimi, MiniMax, etc.) or non-reasoning models
+      return {};
+  }
+}
+
+// ─── Middleware ────────────────────────────────────────────────────────────
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -377,15 +604,8 @@ app.post('/v1/chat/completions', async (req, res) => {
           max_tokens ?? 2048,
           MAX_TOKENS_LIMIT
         ),
-        stream: false,
-
-        extra_body: ENABLE_THINKING_MODE
-          ? {
-              chat_template_kwargs: {
-                thinking: true
-              }
-            }
-          : undefined
+        stream: stream || false,
+       
       };
 
       const response = await postNIM(requestBody);
@@ -611,6 +831,316 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
 });
 
+upstreamStream.on('data', chunk => {
+        buffer += decoder.write(chunk);
+
+        if (buffer.length > MAX_BUFFER_SIZE) {
+          console.error('[STREAM] Buffer overflow, destroying connection');
+          safeWrite(res, `data: ${JSON.stringify({
+            error: {
+              message: 'Stream buffer overflow',
+              type: 'stream_error'
+            }
+          })}\n\n`);
+          safeWrite(res, 'data: [DONE]\n\n');
+          res.end();
+          upstreamStream.destroy();
+          cleanup();
+          return;
+        }
+
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          processLine(line);
+        }
+      });
+
+
+    // Determine if the client wants legacy inline <thinking> tags in the content stream
+    const inlineReasoning = req.headers['x-reasoning-format'] === 'inline';
+
+    if (stream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+
+      const decoder = new StringDecoder('utf8');
+      let buffer = '';
+      let reasoningOpen = false;
+      let doneSent = false;
+      let cleanedUp = false;
+
+      const normalizer = new StreamNormalizer(usedModel);
+
+      const cleanup = () => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        if (upstreamStream) {
+          upstreamStream.removeAllListeners();
+        }
+        req.removeAllListeners('close');
+      };
+
+      const processLine = (line) => {
+        if (!line.startsWith('data: ')) return;
+
+        if (line.includes('[DONE]')) {
+          if (!doneSent) {
+            safeWrite(res, 'data: [DONE]\n\n');
+            doneSent = true;
+          }
+          streamEndedCleanly = true;
+          return;
+        }
+
+        try {
+          const data = JSON.parse(line.slice(6));
+          const delta = data.choices?.[0]?.delta;
+
+          if (delta) {
+            const normalizedDelta = normalizer.processDelta(delta);
+            let clientContent = '';
+
+            if (SHOW_REASONING && inlineReasoning) {
+              // Legacy GoonChat behavior: bake <thinking> tags into content
+              if (normalizedDelta.reasoning && !reasoningOpen) {
+                clientContent += `<thinking>\n${normalizedDelta.reasoning}`;
+                reasoningOpen = true;
+              } else if (normalizedDelta.reasoning) {
+                clientContent += normalizedDelta.reasoning;
+              }
+
+              if (normalizedDelta.content && reasoningOpen) {
+                clientContent += `\n</thinking>\n\n${normalizedDelta.content}`;
+                reasoningOpen = false;
+              } else if (normalizedDelta.content) {
+                clientContent += normalizedDelta.content;
+              }
+            } else {
+              // Default behavior: clean content, no inline tags
+              clientContent = normalizedDelta.content || '';
+            }
+
+            delta.content = clientContent;
+
+            // FIX: keep a structured reasoning field alongside the inline
+            // tags in content. GoonChat parses the inline tags;
+            // clients like Pal Chat / OpenRouter-style apps look for a
+            // separate `reasoning`/`reasoning_content` field to render their
+            // own collapsible thinking UI. Without this, those clients just
+            // see one flat content blob and never show a thinking indicator.
+            if (SHOW_REASONING && normalizedDelta.reasoning) {
+              delta.reasoning = normalizedDelta.reasoning;
+              delta.reasoning_content = normalizedDelta.reasoning;
+            } else {
+              delete delta.reasoning;
+              delete delta.reasoning_content;
+            }
+          }
+
+          safeWrite(res, `data: ${JSON.stringify(data)}\n\n`);
+
+        } catch (parseErr) {
+          console.warn('[STREAM] Invalid JSON line:', line.slice(0, 100));
+          safeWrite(res, `data: ${JSON.stringify({
+            error: {
+              message: 'Upstream sent malformed chunk',
+              type: 'stream_parse_error',
+              details: line.slice(0, 100)
+            }
+          })}\n\n`);
+        }
+      };
+
+      upstreamStream.on('data', chunk => {
+        buffer += decoder.write(chunk);
+
+        if (buffer.length > MAX_BUFFER_SIZE) {
+          console.error('[STREAM] Buffer overflow, destroying connection');
+          safeWrite(res, `data: ${JSON.stringify({
+            error: {
+              message: 'Stream buffer overflow',
+              type: 'stream_error'
+            }
+          })}\n\n`);
+          safeWrite(res, 'data: [DONE]\n\n');
+          res.end();
+          upstreamStream.destroy();
+          cleanup();
+          return;
+        }
+
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          processLine(line);
+        }
+      });
+
+      upstreamStream.on('end', () => {
+        buffer += decoder.end();
+
+        if (buffer.trim()) {
+          for (const line of buffer.split('\n')) {
+            processLine(line);
+          }
+        }
+
+        const flushedDelta = normalizer.flush();
+        if (flushedDelta.content || flushedDelta.reasoning) {
+          let clientContent = '';
+          if (SHOW_REASONING && inlineReasoning) {
+            // Legacy GoonChat behavior: bake <thinking> tags into content
+            if (flushedDelta.reasoning && !reasoningOpen) {
+              clientContent += `<thinking>\n${flushedDelta.reasoning}`;
+              reasoningOpen = true;
+            } else if (flushedDelta.reasoning) {
+              clientContent += flushedDelta.reasoning;
+            }
+            if (flushedDelta.content && reasoningOpen) {
+              clientContent += `\n</thinking>\n\n${flushedDelta.content}`;
+              reasoningOpen = false;
+            } else if (flushedDelta.content) {
+              clientContent += flushedDelta.content;
+            }
+          } else {
+            // Default behavior: clean content, no inline tags
+            clientContent = flushedDelta.content || '';
+          }
+          if (clientContent) {
+            safeWrite(res, `data: ${JSON.stringify({ choices: [{ delta: { content: clientContent } }] })}\n\n`);
+          }
+        }
+
+        if (!doneSent) {
+          safeWrite(res, 'data: [DONE]\n\n');
+        }
+
+        streamEndedCleanly = true;
+        if (!res.writableEnded) {
+          res.end();
+        }
+        cleanup();
+      });
+
+      upstreamStream.on('error', err => {
+        console.error('[STREAM] Upstream error:', err.message);
+
+        if (!res.writableEnded) {
+          safeWrite(res, `data: ${JSON.stringify({
+            error: {
+              message: 'Stream interrupted by upstream error',
+              type: 'stream_error'
+            }
+          })}\n\n`);
+          safeWrite(res, 'data: [DONE]\n\n');
+          res.end();
+        }
+        cleanup();
+      });
+
+      req.on('close', () => {
+        const clientGone = req.destroyed || !res.writable;
+
+        if (!streamEndedCleanly && clientGone) {
+          console.warn('[STREAM] Client disconnected prematurely');
+        }
+
+        if (upstreamStream && !upstreamStream.destroyed && !streamEndedCleanly) {
+          upstreamStream.destroy();
+        }
+        cleanup();
+      });
+
+    } else {
+      // Non-streaming response
+      const openaiResponse = {
+        id: `chatcmpl-${Date.now()}`,
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: model,
+        choices: (response.data.choices || []).map((choice, i) => {
+          const normalizedChoice = normalizeNonStreamChoice(choice, usedModel);
+          let content = normalizedChoice.message?.content || '';
+          const reasoning = normalizedChoice.message?.reasoning || '';
+
+          if (SHOW_REASONING && inlineReasoning && reasoning) {
+            // Legacy GoonChat behavior: bake <thinking> tags into content
+            content = `<thinking>\n${reasoning}\n</thinking>\n\n${content}`;
+          }
+
+          const finalMessage = { ...normalizedChoice.message, content };
+
+          // Same fix as the streaming path: keep the structured field
+          // alongside the inline tags so structured-reasoning clients
+          // (Pal Chat, OpenRouter-style apps) can render their own UI.
+          if (SHOW_REASONING && reasoning) {
+            finalMessage.reasoning = reasoning;
+            finalMessage.reasoning_content = reasoning;
+          } else {
+            delete finalMessage.reasoning;
+            delete finalMessage.reasoning_content;
+          }
+
+          const finalChoice = {
+            ...normalizedChoice,
+            index: i,
+            message: finalMessage
+          };
+          return finalChoice;
+        }),
+        usage: response.data.usage || {
+          prompt_tokens: 0,
+          completion_tokens: 0,
+          total_tokens: 0
+        }
+      };
+
+      res.json(openaiResponse);
+    }
+
+  } catch (error) {
+    console.error('[PROXY] Fatal error:', error.message);
+    console.error('[PROXY] NIM response:', error.response?.data);
+
+    if (!res.headersSent) {
+      res.status(error.response?.status || 500).json({
+        error: {
+          message: error.message,
+          type: 'invalid_request_error',
+          code: error.response?.status || 500
+        }
+      });
+    } else if (!res.writableEnded) {
+      safeWrite(res, `data: ${JSON.stringify({
+        error: {
+          message: error.message,
+          type: 'proxy_error'
+        }
+      })}\n\n`);
+      safeWrite(res, 'data: [DONE]\n\n');
+      res.end();
+    }
+
+    if (upstreamStream && !upstreamStream.destroyed) {
+      upstreamStream.destroy();
+    }
+  }
+});
+
+app.use((req, res) => {
+  res.status(404).json({
+    error: {
+      message: `Endpoint ${req.method} ${req.path} not found`,
+      type: 'invalid_request_error',
+      code: 404
+    }
+  });
+});
+
 // ─── Startup ───────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
@@ -714,13 +1244,14 @@ async function runWithWebSearch({
         max_tokens ?? 2048,
         MAX_TOKENS_LIMIT
       ),
-      stream: false,
+      stream: stream || false,
 
       tools: FASTCRW_TOOLS,
       tool_choice: 'auto',
       parallel_tool_calls: false,
 
-      extra_body: ENABLE_THINKING_MODE
+      
+     extra_body: ENABLE_THINKING_MODE
         ? {
             chat_template_kwargs: {
               thinking: true
