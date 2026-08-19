@@ -1,4 +1,4 @@
-// server.js — Robust Hybrid OpenAI ↔ NIM Proxy
+ // server.js — Robust Hybrid OpenAI ↔ NIM Proxy
 // Express 5 Compatible
 // Includes:
 // - Model-specific reasoning controls
@@ -1152,7 +1152,10 @@ async function runWithWebSearch({
         }))
       : [];
 
-
+  // Track searches performed during this logical request.
+  //
+  // This prevents GLM from asking for the same search again with
+  // slightly different tool arguments.
   const searchedQueries = new Set();
 
   let searchPerformed = false;
@@ -1451,7 +1454,7 @@ async function runWithWebSearch({
     // ─────────────────────────────────────────
     // Important:
     //
-    // Once a search has happened, don't give certain models
+    // Once a search has happened, don't give GLM
     // another opportunity to start a fresh search
     // in the next round.
     //
