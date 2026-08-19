@@ -53,17 +53,6 @@ function validateConfig() {
   if (!CLIENT_AUTH_KEY) {
     console.warn('[WARN] CLIENT_AUTH_KEY not set. All requests will be rejected with 403.');
   }
-}
-
-validateConfig();
-
-  }
-
-  if (!CLIENT_AUTH_KEY) {
-    console.warn(
-      '[WARN] CLIENT_AUTH_KEY not set. All requests will be rejected with 403.'
-    );
-  }
 
   if (ENABLE_WEB_SEARCH && !FASTCRW_API_KEY) {
     fatal('FASTCRW_API_KEY is required when ENABLE_WEB_SEARCH=true');
@@ -74,6 +63,9 @@ validateConfig();
     console.log(`[CONFIG] fastCRW: ${FASTCRW_API_BASE}`);
   }
 }
+
+validateConfig();
+
 
 // ─── Model Mapping ─────────────────────────────────────────────────────────
 
