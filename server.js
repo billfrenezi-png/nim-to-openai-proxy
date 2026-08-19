@@ -289,24 +289,7 @@ const FASTCRW_TOOLS = [
     function: {
       name: 'search_web',
       description:
-        'Search the live web only when current or externally verifiable information is actually needed.
-
-Use search for:
-- current real-world facts
-- recent events or news
-- current public figures
-- current products, games, movies, shows, companies, or software
-- factual details that the supplied conversation/context does not contain
-
-Do NOT search for:
-- creative writing
-- roleplay
-- fictional continuation
-- brainstorming
-- ordinary conversation
-- information already present in the conversation
-
-When searching, prefer a single focused search with 2-3 results.',
+        'Search the live web only when current or externally verifiable information is actually needed. Use search for: - current real-world facts - recent events or news - current public figures - current products, games, movies, shows, companies, or software - factual details that the supplied conversation/context does not contain Do NOT search for: - creative writing - roleplay - fictional continuation - brainstorming - ordinary conversation - information already present in the conversation When searching, prefer a single focused search with 2-3 results.',
       parameters: {
         type: 'object',
         properties: {
