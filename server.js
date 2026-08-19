@@ -90,6 +90,69 @@ const FASTCRW_MAX_TOKENS = Math.min(
 
 const FASTCRW_TIMEOUT_MS = 30000;
 
+
+// ─── FASTCRW Tool Definition ────────────────────────────────────────────────
+
+const FASTCRW_TOOLS = [
+  {
+    type: 'function',
+
+    function: {
+      name: 'search_web',
+
+      description:
+        'Use this tool sparingly and only when the answer genuinely requires external web information. ' +
+        'Do NOT search merely because a topic is interesting, potentially current, or something you could answer from the conversation or general knowledge. ' +
+        'Do NOT search for creative writing, roleplay, fictional continuation, brainstorming, casual conversation, opinions, or requests that can be answered from the supplied context. ' +
+        'Before searching, determine whether web information is actually necessary. ' +
+        'When a search is necessary, make ONE focused search query that directly answers the missing information. ' +
+        'Do not perform multiple searches to explore the same question. ' +
+        'After receiving search results, use them to answer the user rather than automatically searching again.',
+
+      parameters: {
+        type: 'object',
+
+        properties: {
+          query: {
+            type: 'string',
+
+            description:
+              'One focused web search query for information that is genuinely missing from the conversation.'
+          },
+
+          limit: {
+            type: 'integer',
+
+            description:
+              'Number of results to return. Prefer 2-3. Do not request more unless genuinely necessary.',
+
+            minimum: 1,
+            maximum: 5
+          },
+
+          time_range: {
+            type: 'string',
+
+            enum: [
+              'hour',
+              'day',
+              'week',
+              'month',
+              'year',
+              'any'
+            ],
+
+            description:
+              'Optional freshness filter. Use only when freshness actually matters.'
+          }
+        },
+
+        required: ['query']
+      }
+    }
+  }
+];
+
 // ─── Configuration Validation ───────────────────────────────────────────────
 
 function validateConfig() {
