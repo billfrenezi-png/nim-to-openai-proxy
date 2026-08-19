@@ -1096,7 +1096,7 @@ upstreamStream.on('data', chunk => {
       res.json(openaiResponse);
     }
 
-   catch (error) {
+  } catch (error) {
     console.error('[PROXY] Fatal error:', error.message);
     console.error('[PROXY] NIM response:', error.response?.data);
 
