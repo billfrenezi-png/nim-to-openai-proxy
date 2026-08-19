@@ -1,5 +1,3 @@
-Is there anything that might be returning "error 429" on GLM5.2 of this nim-to-proxy script?
-
 // server.js — Robust Hybrid OpenAI ↔ NIM Proxy
 // Express 5 Compatible
 // Fixes: auth bypass, startup DDoS, silent stream failures, memory leaks, Express 5 deprecations
