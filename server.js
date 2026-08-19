@@ -481,7 +481,8 @@ async function postNIM(requestBody) {
           timeout: REQUEST_TIMEOUT_MS
         }
       );
-    } catch (error) {
+    } catch (error)
+    {
       const status = error.response?.status;
 
       if (status !== 429 || attempt === MAX_RETRIES) {
