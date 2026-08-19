@@ -38,7 +38,7 @@ const FASTCRW_API_KEY = process.env.FASTCRW_API_KEY;
 const ENABLE_WEB_SEARCH = process.env.ENABLE_WEB_SEARCH === 'true';
 
 const MAX_TOOL_ROUNDS = Math.min(
-  Math.max(parseInt(process.env.MAX_TOOL_ROUNDS || '3', 10), 1),
+  Math.max(parseInt(process.env.MAX_TOOL_ROUNDS || '2', 10), 1),
   5
 );
 
@@ -807,10 +807,17 @@ async function runWithWebSearch({
         });
       } catch (error) {
         console.error(
-          '[FASTCRW] Search failed:',
-          error.message
+         '[FASTCRW] Search failed:',
+         error.response?.status || 'unknown',
+         error.message
         );
-
+      }
+if (error.response?.data) {
+  console.error(
+    '[FASTCRW] Upstream response:',
+    error.response.data
+  );
+}
         workingMessages.push({
           role: 'tool',
           tool_call_id: toolCall.id,
