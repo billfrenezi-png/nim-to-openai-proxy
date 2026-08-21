@@ -930,13 +930,19 @@ async function postNIM(
       const status =
         error.response?.status;
 
-      if (
-        status !== 429 ||
-        attempt === MAX_RETRIES
-      ) {
-        throw error;
-      }
+const RETRYABLE_STATUSES = new Set([
+  429,
+  502,
+  503,
+  504
+]);
 
+if (
+  !RETRYABLE_STATUSES.has(status) ||
+  attempt === MAX_RETRIES
+) {
+  throw error;
+}
       const delay =
         Math.min(
           1000 *
