@@ -1520,7 +1520,7 @@ async function callNIM({
 
     max_tokens:
       Math.min(
-        max_tokens ?? 2048,
+        max_tokens ?? 8192,
         MAX_TOKENS_LIMIT
       ),
 
