@@ -123,7 +123,7 @@ validateConfig();
 
 const MODEL_MAPPING = {
   'gpt-3.5-turbo':
-    'thinkingmachines/inkling',
+    'moonshotai/kimi-k3',
 
   'gpt-4':
     'nvidia/nemotron-3-ultra-550b-a55b',
