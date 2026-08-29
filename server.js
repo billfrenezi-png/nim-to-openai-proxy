@@ -257,6 +257,9 @@ const RETRY_POLICIES = {
 
   'minimaxai/minimax-m3':
     CONSERVATIVE_RETRY_POLICY
+
+  'moonshotai/kimi-k3':
+    CONSERVATIVE_RETRY_POLICY
 };
 
 function getRetryPolicy(model) {
