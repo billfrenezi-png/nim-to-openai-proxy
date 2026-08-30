@@ -78,35 +78,116 @@ const VALIDATION_TIMEOUT_MS =
 const MAX_BUFFER_SIZE =
   Number(process.env.MAX_BUFFER_SIZE || 1024 * 1024);
 
-// ---------------------------------------------------------------------------
+/ ---------------------------------------------------------------------------
 // FASTCRW limits
 // ---------------------------------------------------------------------------
+//
+// FASTCRW is intentionally conservative.
+//
+// The model may perform multiple searches, but every request has:
+//
+//   - a hard maximum number of searches
+//   - a maximum number of tool rounds
+//   - a maximum number of searches per round
+//   - duplicate-query protection
+//   - query length limits
+//   - a minimum delay between searches
+//   - a maximum result count
+//
+// Recommended defaults:
+//
+//   MAX_TOOL_ROUNDS            = 2
+//   MAX_SEARCHES_PER_REQUEST   = 3
+//   MAX_SEARCH_CALLS_PER_ROUND = 1
+//
+// Typical flow:
+//
+//   User
+//     ↓
+//   Search #1
+//     ↓
+//   inspect result
+//     ↓
+//   Search #2 only if necessary
+//     ↓
+//   inspect result
+//     ↓
+//   Search #3 only if necessary
+//     ↓
+//   final answer
+//
+// ---------------------------------------------------------------------------
 
-// Deliberately conservative.
-//
-// 1 means:
-//   model -> one search -> mandatory synthesis
-//
-// There is intentionally no "search again because the model feels like it".
-const MAX_TOOL_ROUNDS = Math.min(
-  Math.max(
-    Number(process.env.MAX_TOOL_ROUNDS || 1),
-    1
+const MAX_TOOL_ROUNDS = clamp(
+  Number(
+    process.env.MAX_TOOL_ROUNDS || 2
   ),
+  1,
+  4
+);
+
+const MAX_SEARCHES_PER_REQUEST = clamp(
+  Number(
+    process.env.MAX_SEARCHES_PER_REQUEST || 3
+  ),
+  1,
+  8
+);
+
+const MAX_SEARCH_CALLS_PER_ROUND = clamp(
+  Number(
+    process.env.MAX_SEARCH_CALLS_PER_ROUND || 1
+  ),
+  1,
   2
 );
 
-// Maximum actual searches during a single round.
-const MAX_SEARCH_CALLS_PER_ROUND = 1;
+// Prevent a model from firing several searches
+// immediately after each other.
+const MIN_SEARCH_INTERVAL_MS = Math.max(
+  Number(
+    process.env.MIN_SEARCH_INTERVAL_MS || 1500
+  ),
+  0
+);
 
-// Maximum searches during one complete user request.
-//
-// Keeping this at one is the important anti-loop protection.
-const MAX_SEARCHES_PER_REQUEST = 1;
+// Prevent excessively large search queries.
+const MAX_SEARCH_QUERY_LENGTH = clamp(
+  Number(
+    process.env.MAX_SEARCH_QUERY_LENGTH || 300
+  ),
+  32,
+  1000
+);
 
+// Keep the search response relatively small.
+// More results means more context, more tokens,
+// and more opportunities for the model to decide
+// that another search is needed.
+const MAX_SEARCH_RESULTS = clamp(
+  Number(
+    process.env.MAX_SEARCH_RESULTS || 5
+  ),
+  1,
+  10
+);
+
+// Number of previous queries retained for duplicate/
+// near-duplicate detection.
+const MAX_QUERY_HISTORY = 8;
+
+// FASTCRW request timeout.
+const FASTCRW_TIMEOUT_MS = Number(
+  process.env.FASTCRW_TIMEOUT_MS || 30000
+);
+
+// Synthesis gets a slightly larger budget than an
+// ordinary search-planning turn.
 const FASTCRW_MAX_TOKENS = Math.min(
   Math.max(
-    Number(process.env.FASTCRW_MAX_TOKENS || 8192),
+    Number(
+      process.env.FASTCRW_MAX_TOKENS || 8192
+    ),
     256
   ),
   MAX_TOKENS_LIMIT
@@ -1071,11 +1152,25 @@ const FASTCRW_TOOLS = [
       name: 'search_web',
 
       description:
-        'Use this tool ONLY when the answer genuinely requires external web information. ' +
-        'Do not search merely because a topic is current, interesting, or potentially changing. ' +
-        'Do not search for creative writing, roleplay, fictional continuation, brainstorming, casual conversation, opinions, or questions answerable from the supplied context. ' +
-        'Use ONE focused query. ' +
-        'After search results are provided, answer using those results instead of searching again.',
+        'Search the web for information that is genuinely unavailable ' +
+        'from the conversation or model knowledge. ' +
+
+        'Use this tool only when external information is necessary. ' +
+
+        'Do NOT search for casual conversation, creative writing, roleplay, ' +
+        'brainstorming, opinions, explanations that can be answered directly, ' +
+        'or information already present in the conversation. ' +
+
+        'Prefer ONE focused query that addresses the missing information. ' +
+
+        'After receiving results, inspect them before deciding whether another ' +
+        'search is actually necessary. ' +
+
+        'Do not repeat the same query or make trivial variations of it. ' +
+
+        'If the existing search results are sufficient, answer immediately. ' +
+
+        'A maximum search budget applies to the entire request.',
 
       parameters: {
         type: 'object',
@@ -1085,17 +1180,19 @@ const FASTCRW_TOOLS = [
             type: 'string',
 
             description:
-              'One focused web search query for information genuinely missing from the conversation.'
+              'One focused search query. ' +
+              'Avoid multiple unrelated questions in one query.'
           },
 
           limit: {
             type: 'integer',
 
             minimum: 1,
-            maximum: 5,
+            maximum: MAX_SEARCH_RESULTS,
 
             description:
-              'Prefer 2-3 results.'
+              `Number of results requested. Prefer 2-3. ` +
+              `Maximum ${MAX_SEARCH_RESULTS}.`
           },
 
           time_range: {
@@ -1111,17 +1208,126 @@ const FASTCRW_TOOLS = [
             ],
 
             description:
-              'Use a freshness filter only when freshness matters.'
+              'Use a freshness restriction only when freshness matters.'
           }
         },
 
         required: [
           'query'
-        ]
+        ],
+
+        additionalProperties: false
       }
     }
   }
 ];
+
+// ---------------------------------------------------------------------------
+// FASTCRW search pacing
+// ---------------------------------------------------------------------------
+
+async function waitForSearchCooldown(
+  lastSearchAt
+) {
+  if (!lastSearchAt) {
+    return;
+  }
+
+  const elapsed =
+    Date.now() - lastSearchAt;
+
+  const remaining =
+    MIN_SEARCH_INTERVAL_MS -
+    elapsed;
+
+  if (remaining > 0) {
+    await sleep(remaining);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// FASTCRW duplicate / near-duplicate detection
+// ---------------------------------------------------------------------------
+
+function tokenizeQuery(query) {
+  return new Set(
+    normalizeSearchQuery(query)
+      .split(' ')
+      .filter(Boolean)
+  );
+}
+
+function querySimilarity(a, b) {
+  const tokensA =
+    tokenizeQuery(a);
+
+  const tokensB =
+    tokenizeQuery(b);
+
+  if (
+    !tokensA.size ||
+    !tokensB.size
+  ) {
+    return 0;
+  }
+
+  let intersection = 0;
+
+  for (const token of tokensA) {
+    if (tokensB.has(token)) {
+      intersection++;
+    }
+  }
+
+  const union =
+    new Set([
+      ...tokensA,
+      ...tokensB
+    ]).size;
+
+  return union
+    ? intersection / union
+    : 0;
+}
+
+function isDuplicateOrSimilarQuery(
+  query,
+  previousQueries
+) {
+  const normalized =
+    normalizeSearchQuery(query);
+
+  for (
+    const previous of previousQueries
+  ) {
+    const previousNormalized =
+      normalizeSearchQuery(previous);
+
+    // Exact duplicate.
+    if (
+      normalized ===
+      previousNormalized
+    ) {
+      return true;
+    }
+
+    // Near duplicate.
+    //
+    // 0.8 is intentionally fairly high.
+    // We don't want to reject legitimately different
+    // searches that merely share a few words.
+    if (
+      querySimilarity(
+        normalized,
+        previousNormalized
+      ) >= 0.8
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
 
 // ---------------------------------------------------------------------------
 // FASTCRW request
@@ -1226,24 +1432,6 @@ function parseToolArguments(toolCall) {
 // ---------------------------------------------------------------------------
 // FASTCRW tool loop
 // ---------------------------------------------------------------------------
-//
-// The old implementation supported multiple rounds and then separately
-// synthesized. That works, but it gives reasoning-heavy models more
-// opportunities to decide that another search would be useful.
-//
-// This implementation deliberately has a much harder boundary:
-//
-//   request
-//      ↓
-//   model + tool
-//      ↓
-//   at most ONE search
-//      ↓
-//   tool-free synthesis
-//
-// MAX_TOOL_ROUNDS is retained as an environment option, but the global
-// MAX_SEARCHES_PER_REQUEST remains the important safety limit.
-// ---------------------------------------------------------------------------
 
 async function runWithWebSearch({
   selectedModel,
@@ -1260,16 +1448,21 @@ async function runWithWebSearch({
         }))
       : [];
 
-  const searchedQueries =
-    new Set();
+  const searchedQueries = [];
 
   let totalSearches = 0;
+  let lastSearchAt = 0;
 
   for (
     let round = 0;
     round < MAX_TOOL_ROUNDS;
     round++
   ) {
+    console.log(
+      `[FASTCRW] Tool round ${round + 1}/${MAX_TOOL_ROUNDS} ` +
+      `| searches ${totalSearches}/${MAX_SEARCHES_PER_REQUEST}`
+    );
+
     const reasoningPayload =
       getReasoningPayload(
         selectedModel,
@@ -1304,14 +1497,26 @@ async function runWithWebSearch({
       ...reasoningPayload
     };
 
-    // If a search has already occurred, do not expose
-    // the tool again.
+    // ---------------------------------------------------------------
+    // Hard search budget.
+    //
+    // Once the budget is exhausted, tools disappear.
+    //
+    // Unlike the previous version, this happens only after the
+    // configured search budget has actually been consumed.
+    // ---------------------------------------------------------------
+
     if (
       totalSearches >=
       MAX_SEARCHES_PER_REQUEST
     ) {
       delete requestBody.tools;
       delete requestBody.tool_choice;
+
+      console.log(
+        '[FASTCRW] Search budget exhausted. ' +
+        'Forcing final answer.'
+      );
     }
 
     const response =
@@ -1335,36 +1540,43 @@ async function runWithWebSearch({
         ? assistantMessage.tool_calls
         : [];
 
-    // Model answered normally.
-    if (toolCalls.length === 0) {
+    // ---------------------------------------------------------------
+    // Normal answer.
+    // ---------------------------------------------------------------
+
+    if (
+      toolCalls.length === 0
+    ) {
       return response.data;
     }
 
-    // Preserve the assistant tool-call message.
+    // Preserve assistant's tool call.
     workingMessages.push(
       assistantMessage
     );
 
-    let searchCallsThisRound = 0;
+    let searchesThisRound = 0;
 
-    for (const toolCall of toolCalls) {
-      if (
-        toolCall.type !== 'function'
-      ) {
-        continue;
-      }
-
+    for (
+      const toolCall of toolCalls
+    ) {
       const functionName =
         toolCall.function?.name;
 
+      // -------------------------------------------------------------
+      // Unknown tool.
+      // -------------------------------------------------------------
+
       if (
-        functionName !== 'search_web'
+        functionName !==
+        'search_web'
       ) {
         workingMessages.push(
           makeToolResult(
             toolCall.id,
             {
               success: false,
+
               error:
                 `Unknown tool: ${functionName}`
             }
@@ -1374,7 +1586,10 @@ async function runWithWebSearch({
         continue;
       }
 
-      // Hard global search limit.
+      // -------------------------------------------------------------
+      // Global search limit.
+      // -------------------------------------------------------------
+
       if (
         totalSearches >=
         MAX_SEARCHES_PER_REQUEST
@@ -1384,8 +1599,10 @@ async function runWithWebSearch({
             toolCall.id,
             {
               success: false,
+
               error:
-                'Search limit reached for this request. Answer using the information already available.'
+                'The maximum number of web searches for this request has been reached. ' +
+                'Use the information already gathered and answer the user.'
             }
           )
         );
@@ -1393,9 +1610,12 @@ async function runWithWebSearch({
         continue;
       }
 
-      // Hard per-round limit.
+      // -------------------------------------------------------------
+      // Per-round search limit.
+      // -------------------------------------------------------------
+
       if (
-        searchCallsThisRound >=
+        searchesThisRound >=
         MAX_SEARCH_CALLS_PER_ROUND
       ) {
         workingMessages.push(
@@ -1403,14 +1623,20 @@ async function runWithWebSearch({
             toolCall.id,
             {
               success: false,
+
               error:
-                'Only one web search is permitted in this round. Use the available search results.'
+                'Only one focused web search is permitted in this tool round. ' +
+                'Use the available search results.'
             }
           )
         );
 
         continue;
       }
+
+      // -------------------------------------------------------------
+      // Parse arguments.
+      // -------------------------------------------------------------
 
       const args =
         parseToolArguments(
@@ -1423,67 +1649,37 @@ async function runWithWebSearch({
             toolCall.id,
             {
               success: false,
+
               error:
-                'Invalid tool arguments.'
+                'Invalid search tool arguments.'
             }
           )
         );
 
         continue;
       }
+
+      // -------------------------------------------------------------
+      // Validate query.
+      // -------------------------------------------------------------
 
       const query =
-        String(
-          args.query || ''
-        ).trim();
-
-      const limit =
-        clamp(
-          Number(args.limit) || 3,
-          1,
-          5
+        cleanSearchQuery(
+          args.query
         );
 
-      const timeRange =
-        args.time_range ||
-        'any';
-
-      if (!query) {
-        workingMessages.push(
-          makeToolResult(
-            toolCall.id,
-            {
-              success: false,
-              error:
-                'Search query is empty. Answer using the available context.'
-            }
-          )
-        );
-
-        continue;
-      }
-
-      const normalizedQuery =
-        normalizeSearchQuery(
-          query
-        );
-
-      const searchKey =
-        `${normalizedQuery}|${timeRange}`;
-
-      // Duplicate protection.
       if (
-        searchedQueries.has(
-          searchKey
-        )
+        !isValidSearchQuery(query)
       ) {
         workingMessages.push(
           makeToolResult(
             toolCall.id,
             {
               success: false,
+
               error:
-                'This search has already been performed. Use the existing results.'
+                `Search query must contain between 2 and ` +
+                `${MAX_SEARCH_QUERY_LENGTH} characters.`
             }
           )
         );
@@ -1491,15 +1687,95 @@ async function runWithWebSearch({
         continue;
       }
 
-      searchedQueries.add(
-        searchKey
+      // -------------------------------------------------------------
+      // Duplicate / near-duplicate protection.
+      // -------------------------------------------------------------
+
+      if (
+        isDuplicateOrSimilarQuery(
+          query,
+          searchedQueries
+        )
+      ) {
+        console.log(
+          `[FASTCRW] Blocked duplicate/near-duplicate query: ${query}`
+        );
+
+        workingMessages.push(
+          makeToolResult(
+            toolCall.id,
+            {
+              success: false,
+
+              error:
+                'A substantially identical search has already been performed. ' +
+                'Use those results instead of repeating the search.'
+            }
+          )
+        );
+
+        continue;
+      }
+
+      // -------------------------------------------------------------
+      // Validate result count.
+      // -------------------------------------------------------------
+
+      const limit =
+        clamp(
+          Number(args.limit) || 3,
+          1,
+          MAX_SEARCH_RESULTS
+        );
+
+      const timeRange =
+        [
+          'hour',
+          'day',
+          'week',
+          'month',
+          'year',
+          'any'
+        ].includes(
+          args.time_range
+        )
+          ? args.time_range
+          : 'any';
+
+      // -------------------------------------------------------------
+      // Search pacing.
+      // -------------------------------------------------------------
+
+      await waitForSearchCooldown(
+        lastSearchAt
       );
 
-      searchCallsThisRound++;
+      lastSearchAt =
+        Date.now();
+
+      // -------------------------------------------------------------
+      // Execute search.
+      // -------------------------------------------------------------
+
       totalSearches++;
+      searchesThisRound++;
+
+      searchedQueries.push(
+        query
+      );
+
+      // Keep history bounded.
+      if (
+        searchedQueries.length >
+        MAX_QUERY_HISTORY
+      ) {
+        searchedQueries.shift();
+      }
 
       console.log(
-        `[FASTCRW] Search ${totalSearches}/${MAX_SEARCHES_PER_REQUEST}: ${query}`
+        `[FASTCRW] Search ` +
+        `${totalSearches}/${MAX_SEARCHES_PER_REQUEST}: ` +
+        `"${query}"`
       );
 
       try {
@@ -1517,95 +1793,94 @@ async function runWithWebSearch({
           )
         );
       } catch (error) {
+        console.error(
+          '[FASTCRW] Search failed:',
+          error.message
+        );
+
         workingMessages.push(
           makeToolResult(
             toolCall.id,
             {
               success: false,
+
               error:
-                'Live web search failed.'
+                'The web search failed. ' +
+                'Continue using the available conversation context.'
             }
           )
         );
       }
     }
 
-    // -----------------------------------------------------------------------
-    // Search happened.
+    // ---------------------------------------------------------------
+    // If we still have search budget, allow the model to inspect
+    // the results and decide whether another search is genuinely
+    // necessary.
     //
-    // Do NOT expose tools again.
-    // This is deliberately a separate synthesis request.
-    // -----------------------------------------------------------------------
+    // This is the key difference from the previous implementation.
+    // ---------------------------------------------------------------
 
     if (
-      totalSearches > 0
+      totalSearches <
+      MAX_SEARCHES_PER_REQUEST
     ) {
-      return runSynthesisRequest({
-        selectedModel,
-        messages:
-          workingMessages,
-        temperature,
-        max_tokens,
-        enableThinking,
-        reasoningEffort
-      });
+      continue;
     }
-  }
 
-  // Extremely defensive fallback.
-  return runSynthesisRequest({
-    selectedModel,
-    messages:
-      workingMessages,
-    temperature,
-    max_tokens,
-    enableThinking,
-    reasoningEffort
-  });
-}
+    // ---------------------------------------------------------------
+    // Search budget exhausted.
+    //
+    // Force a final tool-free synthesis request.
+    // ---------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Tool-free synthesis
-// ---------------------------------------------------------------------------
-
-async function runSynthesisRequest({
-  selectedModel,
-  messages,
-  temperature,
-  max_tokens,
-  enableThinking,
-  reasoningEffort
-}) {
-  const reasoningPayload =
-    getReasoningPayload(
-      selectedModel,
-      enableThinking,
-      reasoningEffort,
-      false
+    console.log(
+      '[FASTCRW] Search budget exhausted. ' +
+      'Starting final synthesis.'
     );
 
-  const response =
-    await postNIM({
-      model: selectedModel,
+    return runSynthesisRequest({
+      selectedModel,
 
-      messages,
+      messages:
+        workingMessages,
 
-      temperature:
-        temperature ?? 0.7,
+      temperature,
 
-      max_tokens:
-        Math.min(
-          max_tokens ??
-            FASTCRW_MAX_TOKENS,
-          FASTCRW_MAX_TOKENS
-        ),
+      max_tokens,
 
-      stream: false,
+      enableThinking,
 
-      ...reasoningPayload
+      reasoningEffort
     });
+  }
 
-  return response.data;
+  // -----------------------------------------------------------------
+  // Tool rounds exhausted before search budget was exhausted.
+  //
+  // This prevents a model from using an unlimited number of tool
+  // rounds even when the search count itself is still below the cap.
+  // -----------------------------------------------------------------
+
+  console.log(
+    '[FASTCRW] Tool-round limit reached. ' +
+    'Starting final synthesis.'
+  );
+
+  return runSynthesisRequest({
+    selectedModel,
+
+    messages:
+      workingMessages,
+
+    temperature,
+
+    max_tokens,
+
+    enableThinking,
+
+    reasoningEffort
+  });
 }
 
 // ---------------------------------------------------------------------------
