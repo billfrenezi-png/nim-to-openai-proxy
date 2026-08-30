@@ -429,27 +429,54 @@ function validateConfig() {
 
 validateConfig();
 
-// ---------------------------------------------------------------------------
-// CORS
-// ---------------------------------------------------------------------------
-
-app.use(
-  cors({
-    origin: true,
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: [
-      'Content-Type',
-      'Authorization',
-      'X-Reasoning-Format'
-    ]
-  })
-);
-
-app.options('*', cors());
-
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // AUTHENTICATION
-// ---------------------------------------------------------------------------
+// ===========================================================================
+
+function extractBearerToken(header) {
+  if (
+    !header ||
+    typeof header !== 'string'
+  ) {
+    return null;
+  }
+
+  const match =
+    header.trim().match(
+      /^Bearer\s+(.+)$/i
+    );
+
+  return match
+    ? match[1]
+    : null;
+}
+
+function safeTimingEqual(a, b) {
+  if (
+    typeof a !== 'string' ||
+    typeof b !== 'string' ||
+    !a ||
+    !b
+  ) {
+    return false;
+  }
+
+  const aBuffer = Buffer.from(a);
+  const bBuffer = Buffer.from(b);
+
+  if (aBuffer.length !== bBuffer.length) {
+    return false;
+  }
+
+  try {
+    return timingSafeEqual(
+      aBuffer,
+      bBuffer
+    );
+  } catch {
+    return false;
+  }
+}
 
 app.use((req, res, next) => {
   // These endpoints intentionally remain public.
@@ -458,11 +485,6 @@ app.use((req, res, next) => {
     req.path === '/v1/models'
   ) {
     return next();
-  }
-
-  // Let CORS preflight through.
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(204);
   }
 
   const token = extractBearerToken(
@@ -501,6 +523,12 @@ app.use((req, res, next) => {
 
   next();
 });
+
+// ===========================================================================
+// MIDDLEWARE
+// ===========================================================================
+
+app.use(cors());
 
 app.use(
   express.json({
