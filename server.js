@@ -433,18 +433,7 @@ validateConfig();
 // CORS
 // ===========================================================================
 
-app.use(cors({
-  origin: true,
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: [
-    'Content-Type',
-    'Authorization',
-    'X-Reasoning-Format'
-  ],
-  credentials: false
-}));
-
-app.options('*', cors());
+app.use(cors());
 
 // ===========================================================================
 // AUTHENTICATION
@@ -497,7 +486,7 @@ app.use((req, res, next) => {
 });
 
 // ===========================================================================
-// BODY PARSER
+// MIDDLEWARE
 // ===========================================================================
 
 app.use(
