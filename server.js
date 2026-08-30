@@ -478,6 +478,61 @@ function safeTimingEqual(a, b) {
   }
 }
 
+  if (
+    !token ||
+    !CLIENT_AUTH_KEY
+  ) {
+    return res.status(403).json({
+      error: {
+        message:
+          'Forbidden: Invalid or missing authentication',
+        type: 'authentication_error',
+        code: 403
+      }
+    });
+  }
+
+  if (
+    !safeTimingEqual(
+      token,
+      CLIENT_AUTH_KEY
+    )
+  ) {
+    return res.status(403).json({
+      error: {
+        message:
+          'Forbidden: Invalid authentication credentials',
+        type: 'authentication_error',
+        code: 403
+      }
+    });
+  }
+
+  next();
+});
+
+// ---------------------------------------------------------------------------
+// CORS
+// ---------------------------------------------------------------------------
+
+app.use(
+  cors({
+    origin: true,
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'X-Reasoning-Format'
+    ]
+  })
+);
+
+app.options('*', cors());
+
+// ---------------------------------------------------------------------------
+// AUTHENTICATION
+// ---------------------------------------------------------------------------
+
 app.use((req, res, next) => {
   // These endpoints intentionally remain public.
   if (
@@ -485,6 +540,11 @@ app.use((req, res, next) => {
     req.path === '/v1/models'
   ) {
     return next();
+  }
+
+  // Let CORS preflight through.
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
   }
 
   const token = extractBearerToken(
@@ -523,12 +583,6 @@ app.use((req, res, next) => {
 
   next();
 });
-
-// ===========================================================================
-// MIDDLEWARE
-// ===========================================================================
-
-app.use(cors());
 
 app.use(
   express.json({
