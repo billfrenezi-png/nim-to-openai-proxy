@@ -1,5 +1,5 @@
 // NIMTOPROXY.js
-// Clean Hybrid OpenAI ↔ NVIDIA NIM Proxy
+// Clean Hybrid OpenAI <-> NVIDIA NIM Proxy
 //
 // Features:
 // - OpenAI-compatible /v1/chat/completions
@@ -28,9 +28,9 @@ const { timingSafeEqual } = require('crypto');
 
 const app = express();
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// CONFIGURATION
+// ===========================================================================
 
 const PORT = Number(process.env.PORT || 3000);
 
@@ -62,140 +62,123 @@ const SKIP_VALIDATION =
 const DISCORD_WEBHOOK_URL =
   process.env.DISCORD_WEBHOOK_URL;
 
-// General request limits.
+// ---------------------------------------------------------------------------
+// General limits
+// ---------------------------------------------------------------------------
+
 const MAX_TOKENS_LIMIT = 66536;
 const DEFAULT_MAX_TOKENS = 8192;
 
-const REQUEST_TIMEOUT_MS =
-  Number(process.env.REQUEST_TIMEOUT_MS || 180000);
+const REQUEST_TIMEOUT_MS = positiveNumber(
+  process.env.REQUEST_TIMEOUT_MS,
+  180000
+);
 
-const FASTCRW_TIMEOUT_MS =
-  Number(process.env.FASTCRW_TIMEOUT_MS || 30000);
+const FASTCRW_TIMEOUT_MS = positiveNumber(
+  process.env.FASTCRW_TIMEOUT_MS,
+  30000
+);
 
-const VALIDATION_TIMEOUT_MS =
-  Number(process.env.VALIDATION_TIMEOUT_MS || 15000);
+const VALIDATION_TIMEOUT_MS = positiveNumber(
+  process.env.VALIDATION_TIMEOUT_MS,
+  15000
+);
 
-const MAX_BUFFER_SIZE =
-  Number(process.env.MAX_BUFFER_SIZE || 1024 * 1024);
+const MAX_BUFFER_SIZE = positiveNumber(
+  process.env.MAX_BUFFER_SIZE,
+  1024 * 1024
+);
 
-/ ---------------------------------------------------------------------------
-// FASTCRW limits
 // ---------------------------------------------------------------------------
+// FASTCRW limits
 //
-// FASTCRW is intentionally conservative.
+// Intentionally conservative.
 //
-// The model may perform multiple searches, but every request has:
+// The important part is that the model cannot continuously search:
 //
-//   - a hard maximum number of searches
-//   - a maximum number of tool rounds
-//   - a maximum number of searches per round
-//   - duplicate-query protection
-//   - query length limits
-//   - a minimum delay between searches
-//   - a maximum result count
+//   - maximum 2 tool rounds by default
+//   - maximum 2 searches for the whole request
+//   - maximum 1 actual search per round
+//   - duplicate / near-duplicate protection
+//   - minimum delay between searches
 //
-// Recommended defaults:
-//
-//   MAX_TOOL_ROUNDS            = 2
-//   MAX_SEARCHES_PER_REQUEST   = 3
-//   MAX_SEARCH_CALLS_PER_ROUND = 1
-//
-// Typical flow:
-//
-//   User
-//     ↓
-//   Search #1
-//     ↓
-//   inspect result
-//     ↓
-//   Search #2 only if necessary
-//     ↓
-//   inspect result
-//     ↓
-//   Search #3 only if necessary
-//     ↓
-//   final answer
-//
+// This is deliberately less trigger-happy.
 // ---------------------------------------------------------------------------
 
 const MAX_TOOL_ROUNDS = clamp(
-  Number(
-    process.env.MAX_TOOL_ROUNDS || 2
+  integerOrDefault(
+    process.env.MAX_TOOL_ROUNDS,
+    2
   ),
   1,
   4
 );
 
 const MAX_SEARCHES_PER_REQUEST = clamp(
-  Number(
-    process.env.MAX_SEARCHES_PER_REQUEST || 3
+  integerOrDefault(
+    process.env.MAX_SEARCHES_PER_REQUEST,
+    2
   ),
   1,
   8
 );
 
 const MAX_SEARCH_CALLS_PER_ROUND = clamp(
-  Number(
-    process.env.MAX_SEARCH_CALLS_PER_ROUND || 1
+  integerOrDefault(
+    process.env.MAX_SEARCH_CALLS_PER_ROUND,
+    1
   ),
   1,
   2
 );
 
-// Prevent a model from firing several searches
-// immediately after each other.
 const MIN_SEARCH_INTERVAL_MS = Math.max(
-  Number(
-    process.env.MIN_SEARCH_INTERVAL_MS || 1500
+  integerOrDefault(
+    process.env.MIN_SEARCH_INTERVAL_MS,
+    2500
   ),
   0
 );
 
-// Prevent excessively large search queries.
 const MAX_SEARCH_QUERY_LENGTH = clamp(
-  Number(
-    process.env.MAX_SEARCH_QUERY_LENGTH || 300
+  integerOrDefault(
+    process.env.MAX_SEARCH_QUERY_LENGTH,
+    300
   ),
   32,
   1000
 );
 
-// Keep the search response relatively small.
-// More results means more context, more tokens,
-// and more opportunities for the model to decide
-// that another search is needed.
 const MAX_SEARCH_RESULTS = clamp(
-  Number(
-    process.env.MAX_SEARCH_RESULTS || 5
+  integerOrDefault(
+    process.env.MAX_SEARCH_RESULTS,
+    5
   ),
   1,
   10
 );
 
-// Number of previous queries retained for duplicate/
-// near-duplicate detection.
-const MAX_QUERY_HISTORY = 8;
-
-// FASTCRW request timeout.
-const FASTCRW_TIMEOUT_MS = Number(
-  process.env.FASTCRW_TIMEOUT_MS || 30000
+const MAX_QUERY_HISTORY = clamp(
+  integerOrDefault(
+    process.env.MAX_QUERY_HISTORY,
+    8
+  ),
+  1,
+  32
 );
 
-// Synthesis gets a slightly larger budget than an
-// ordinary search-planning turn.
-const FASTCRW_MAX_TOKENS = Math.min(
-  Math.max(
-    Number(
-      process.env.FASTCRW_MAX_TOKENS || 8192
-    ),
-    256
+const FASTCRW_MAX_TOKENS = clamp(
+  integerOrDefault(
+    process.env.FASTCRW_MAX_TOKENS,
+    8192
   ),
+  256,
   MAX_TOKENS_LIMIT
 );
 
-// ---------------------------------------------------------------------------
-// Model mapping
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// MODEL MAPPING
+// ===========================================================================
 
 const MODEL_MAPPING = {
   'gpt-3.5-turbo':
@@ -271,68 +254,42 @@ const MODEL_MAPPING = {
     'stepfun-ai/step-3.7-flash'
 };
 
-// ---------------------------------------------------------------------------
-// Model retry profiles
-// ---------------------------------------------------------------------------
-//
-// IMPORTANT:
-//
-// A retry is not free.
-//
-// On a busy NIM endpoint, aggressive retries can turn:
-//
-//   one 429
-//
-// into:
-//
-//   429 -> 429 -> 429 -> 429
-//
-// which makes the situation worse.
-//
-// GLM and MiniMax M3 therefore get particularly conservative policies.
-//
-// retryCount = number of retries AFTER the initial request.
-//
-// Example:
-//   retryCount: 1
-//
-// means maximum 2 attempts total.
-//
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// RETRY POLICIES
+// ===========================================================================
 
-const DEFAULT_RETRY_POLICY = {
+const DEFAULT_RETRY_POLICY = Object.freeze({
+  // Maximum retries AFTER the initial request.
   retryCount: 2,
 
-  // Initial delay for transient 5xx errors.
-  serverBaseDelayMs: 2000,
+  // 5xx errors.
+  serverBaseDelayMs: 2500,
 
-  // Initial delay for 429.
-  rateLimitBaseDelayMs: 4000,
-
-  // Maximum calculated delay.
-  maxDelayMs: 30000,
-
-  // Random jitter.
-  jitterMs: 750
-};
-
-const CONSERVATIVE_RETRY_POLICY = {
-  // Only one retry after the initial request.
-  retryCount: 1,
-
-  // Wait longer instead of immediately hitting the endpoint again.
-  serverBaseDelayMs: 5000,
-
-  // Rate limits deserve an even longer pause.
+  // 429 errors.
   rateLimitBaseDelayMs: 8000,
 
-  maxDelayMs: 55000,
+  // Never wait longer than this from calculated backoff.
+  maxDelayMs: 60000,
 
-  jitterMs: 1200
-};
+  // Randomized jitter prevents synchronized retries.
+  jitterMs: 1500
+});
+
+// GLM / M3 are treated more carefully because hammering a busy
+// endpoint with retries generally makes 429 behavior worse.
+const CONSERVATIVE_RETRY_POLICY = Object.freeze({
+  retryCount: 1,
+
+  serverBaseDelayMs: 6000,
+
+  rateLimitBaseDelayMs: 12000,
+
+  maxDelayMs: 60000,
+
+  jitterMs: 2000
+});
 
 const RETRY_POLICIES = {
-  // These models are intentionally conservative.
   'z-ai/glm-5.2':
     CONSERVATIVE_RETRY_POLICY,
 
@@ -343,13 +300,105 @@ const RETRY_POLICIES = {
     CONSERVATIVE_RETRY_POLICY
 };
 
+const RETRYABLE_STATUS_CODES = new Set([
+  429,
+  502,
+  503,
+  504
+]);
+
 function getRetryPolicy(model) {
-  return RETRY_POLICIES[model] || DEFAULT_RETRY_POLICY;
+  return (
+    RETRY_POLICIES[model] ||
+    DEFAULT_RETRY_POLICY
+  );
 }
 
-// ---------------------------------------------------------------------------
-// Configuration validation
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// SMALL HELPERS
+// ===========================================================================
+
+function sleep(ms) {
+  return new Promise(resolve => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function clamp(value, min, max) {
+  return Math.min(
+    Math.max(value, min),
+    max
+  );
+}
+
+function integerOrDefault(value, fallback) {
+  const parsed = Number(value);
+
+  return Number.isFinite(parsed)
+    ? Math.floor(parsed)
+    : fallback;
+}
+
+function positiveNumber(value, fallback) {
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+
+  return parsed;
+}
+
+function safeWrite(res, data) {
+  try {
+    if (
+      !res.writableEnded &&
+      !res.destroyed &&
+      res.writable
+    ) {
+      res.write(data);
+      return true;
+    }
+  } catch (error) {
+    console.warn(
+      '[STREAM] Write failed:',
+      error.message
+    );
+  }
+
+  return false;
+}
+
+function normalizeSearchQuery(query) {
+  return String(query || '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function cleanSearchQuery(query) {
+  return String(query || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, MAX_SEARCH_QUERY_LENGTH);
+}
+
+function isValidSearchQuery(query) {
+  if (typeof query !== 'string') {
+    return false;
+  }
+
+  const normalized = query.trim();
+
+  return (
+    normalized.length >= 2 &&
+    normalized.length <= MAX_SEARCH_QUERY_LENGTH
+  );
+}
+
+// ===========================================================================
+// CONFIG VALIDATION
+// ===========================================================================
 
 function validateConfig() {
   const fatal = message => {
@@ -358,18 +407,20 @@ function validateConfig() {
   };
 
   if (!NIM_API_KEY) {
-    fatal(
-      'NIM_API_KEY is required.'
-    );
+    fatal('NIM_API_KEY is required.');
   }
 
   if (!CLIENT_AUTH_KEY) {
     console.warn(
-      '[WARN] CLIENT_AUTH_KEY is not configured. Requests will be rejected.'
+      '[WARN] CLIENT_AUTH_KEY is not configured. ' +
+      'Protected requests will be rejected.'
     );
   }
 
-  if (ENABLE_WEB_SEARCH && !FASTCRW_API_KEY) {
+  if (
+    ENABLE_WEB_SEARCH &&
+    !FASTCRW_API_KEY
+  ) {
     fatal(
       'FASTCRW_API_KEY is required when ENABLE_WEB_SEARCH=true.'
     );
@@ -378,9 +429,116 @@ function validateConfig() {
 
 validateConfig();
 
-// ---------------------------------------------------------------------------
-// Reasoning delimiter parser
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// AUTHENTICATION
+// ===========================================================================
+
+function extractBearerToken(header) {
+  if (
+    !header ||
+    typeof header !== 'string'
+  ) {
+    return null;
+  }
+
+  const match =
+    header.trim().match(
+      /^Bearer\s+(.+)$/i
+    );
+
+  return match
+    ? match[1]
+    : null;
+}
+
+function safeTimingEqual(a, b) {
+  if (
+    typeof a !== 'string' ||
+    typeof b !== 'string' ||
+    !a ||
+    !b
+  ) {
+    return false;
+  }
+
+  const aBuffer = Buffer.from(a);
+  const bBuffer = Buffer.from(b);
+
+  if (aBuffer.length !== bBuffer.length) {
+    return false;
+  }
+
+  try {
+    return timingSafeEqual(
+      aBuffer,
+      bBuffer
+    );
+  } catch {
+    return false;
+  }
+}
+
+app.use((req, res, next) => {
+  // These endpoints intentionally remain public.
+  if (
+    req.path === '/health' ||
+    req.path === '/v1/models'
+  ) {
+    return next();
+  }
+
+  const token = extractBearerToken(
+    req.headers.authorization
+  );
+
+  if (
+    !token ||
+    !CLIENT_AUTH_KEY
+  ) {
+    return res.status(403).json({
+      error: {
+        message:
+          'Forbidden: Invalid or missing authentication',
+        type: 'authentication_error',
+        code: 403
+      }
+    });
+  }
+
+  if (
+    !safeTimingEqual(
+      token,
+      CLIENT_AUTH_KEY
+    )
+  ) {
+    return res.status(403).json({
+      error: {
+        message:
+          'Forbidden: Invalid authentication credentials',
+        type: 'authentication_error',
+        code: 403
+      }
+    });
+  }
+
+  next();
+});
+
+// ===========================================================================
+// MIDDLEWARE
+// ===========================================================================
+
+app.use(cors());
+
+app.use(
+  express.json({
+    limit: '10mb'
+  })
+);
+
+// ===========================================================================
+// REASONING DELIMITER PARSER
+// ===========================================================================
 
 class DelimiterParser {
   constructor(openTag, closeTag) {
@@ -408,10 +566,12 @@ class DelimiterParser {
         ? this.closeTag
         : this.openTag;
 
-      const index = this.buffer.indexOf(target);
+      const index =
+        this.buffer.indexOf(target);
 
       if (index !== -1) {
-        const before = this.buffer.slice(0, index);
+        const before =
+          this.buffer.slice(0, index);
 
         if (this.inThinking) {
           reasoning += before;
@@ -419,7 +579,8 @@ class DelimiterParser {
           content += before;
         }
 
-        this.inThinking = !this.inThinking;
+        this.inThinking =
+          !this.inThinking;
 
         this.buffer =
           this.buffer.slice(
@@ -429,8 +590,8 @@ class DelimiterParser {
         continue;
       }
 
-      // Preserve a partial delimiter at the end
-      // of the current chunk.
+      // Preserve a possible partial delimiter
+      // at the end of the current chunk.
       let partialLength = 0;
 
       const maxLength = Math.min(
@@ -443,23 +604,26 @@ class DelimiterParser {
         length > 0;
         length--
       ) {
-        if (
-          target.startsWith(
-            this.buffer.slice(
-              this.buffer.length - length
-            )
-          )
-        ) {
+        const suffix =
+          this.buffer.slice(
+            this.buffer.length - length
+          );
+
+        if (target.startsWith(suffix)) {
           partialLength = length;
           break;
         }
       }
 
       const safeLength =
-        this.buffer.length - partialLength;
+        this.buffer.length -
+        partialLength;
 
       const safeText =
-        this.buffer.slice(0, safeLength);
+        this.buffer.slice(
+          0,
+          safeLength
+        );
 
       if (this.inThinking) {
         reasoning += safeText;
@@ -499,9 +663,9 @@ class DelimiterParser {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Reasoning helpers
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// REASONING NORMALIZATION
+// ===========================================================================
 
 const THINK_TAG_MODELS = new Set([
   'qwen/qwen3.5-397b-a17b',
@@ -521,8 +685,8 @@ function createThinkingParser(model) {
 
 class StreamNormalizer {
   constructor(model) {
-    this.model = model;
-    this.parser = createThinkingParser(model);
+    this.parser =
+      createThinkingParser(model);
   }
 
   processDelta(delta) {
@@ -536,7 +700,8 @@ class StreamNormalizer {
       '';
 
     let content =
-      normalized.content || '';
+      normalized.content ||
+      '';
 
     if (
       !reasoning &&
@@ -579,12 +744,16 @@ class StreamNormalizer {
   }
 }
 
-function normalizeNonStreamChoice(choice, model) {
+function normalizeNonStreamChoice(
+  choice,
+  model
+) {
   if (!choice) {
     return choice;
   }
 
-  const message = choice.message || {};
+  const message =
+    choice.message || {};
 
   let reasoning =
     message.reasoning ||
@@ -592,14 +761,16 @@ function normalizeNonStreamChoice(choice, model) {
     '';
 
   let content =
-    message.content || '';
+    message.content ||
+    '';
 
   if (
     !reasoning &&
     content &&
     THINK_TAG_MODELS.has(model)
   ) {
-    const parser = createThinkingParser(model);
+    const parser =
+      createThinkingParser(model);
 
     const parsed =
       parser.processChunk(content);
@@ -636,9 +807,9 @@ function normalizeNonStreamChoice(choice, model) {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Model-specific reasoning payload
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// MODEL-SPECIFIC REASONING PAYLOAD
+// ===========================================================================
 
 function getReasoningPayload(
   model,
@@ -646,7 +817,10 @@ function getReasoningPayload(
   reasoningEffort,
   hasTools
 ) {
-  const effort = reasoningEffort;
+  const effort =
+    typeof reasoningEffort === 'string'
+      ? reasoningEffort
+      : undefined;
 
   switch (model) {
     case 'nvidia/nemotron-3-super-120b-a12b':
@@ -709,7 +883,8 @@ function getReasoningPayload(
     case 'openai/gpt-oss-20b': {
       if (
         effort &&
-        ['low', 'medium', 'high'].includes(effort)
+        ['low', 'medium', 'high']
+          .includes(effort)
       ) {
         return {
           reasoning_effort: effort
@@ -729,7 +904,8 @@ function getReasoningPayload(
     case 'mistralai/mistral-small-4-119b-2603': {
       if (
         effort &&
-        ['high', 'none'].includes(effort)
+        ['high', 'none']
+          .includes(effort)
       ) {
         return {
           reasoning_effort: effort
@@ -748,9 +924,10 @@ function getReasoningPayload(
     case 'z-ai/glm-5.2': {
       const payload = {
         thinking: {
-          type: enableThinking
-            ? 'enabled'
-            : 'disabled'
+          type:
+            enableThinking
+              ? 'enabled'
+              : 'disabled'
         }
       };
 
@@ -758,7 +935,8 @@ function getReasoningPayload(
         enableThinking &&
         effort
       ) {
-        payload.reasoning_effort = effort;
+        payload.reasoning_effort =
+          effort;
       }
 
       return payload;
@@ -791,155 +969,9 @@ function getReasoningPayload(
   }
 }
 
-// ---------------------------------------------------------------------------
-// Middleware
-// ---------------------------------------------------------------------------
-
-app.use(cors());
-
-app.use(
-  express.json({
-    limit: '10mb'
-  })
-);
-
-// ---------------------------------------------------------------------------
-// Authentication
-// ---------------------------------------------------------------------------
-
-function extractBearerToken(header) {
-  if (
-    !header ||
-    typeof header !== 'string'
-  ) {
-    return null;
-  }
-
-  const match =
-    header.trim().match(
-      /^Bearer\s+(.+)$/i
-    );
-
-  return match
-    ? match[1]
-    : null;
-}
-
-function safeTimingEqual(a, b) {
-  if (
-    !a ||
-    !b ||
-    typeof a !== 'string' ||
-    typeof b !== 'string' ||
-    a.length !== b.length
-  ) {
-    return false;
-  }
-
-  try {
-    return timingSafeEqual(
-      Buffer.from(a),
-      Buffer.from(b)
-    );
-  } catch {
-    return false;
-  }
-}
-
-app.use((req, res, next) => {
-  if (
-    req.path === '/health' ||
-    req.path === '/v1/models'
-  ) {
-    return next();
-  }
-
-  const token =
-    extractBearerToken(
-      req.headers.authorization
-    );
-
-  if (
-    !token ||
-    !CLIENT_AUTH_KEY
-  ) {
-    return res.status(403).json({
-      error: {
-        message:
-          'Forbidden: Invalid or missing authentication',
-        type: 'authentication_error',
-        code: 403
-      }
-    });
-  }
-
-  if (
-    !safeTimingEqual(
-      token,
-      CLIENT_AUTH_KEY
-    )
-  ) {
-    return res.status(403).json({
-      error: {
-        message:
-          'Forbidden: Invalid authentication credentials',
-        type: 'authentication_error',
-        code: 403
-      }
-    });
-  }
-
-  next();
-});
-
-// ---------------------------------------------------------------------------
-// Small helpers
-// ---------------------------------------------------------------------------
-
-function sleep(ms) {
-  return new Promise(resolve =>
-    setTimeout(resolve, ms)
-  );
-}
-
-function safeWrite(res, data) {
-  try {
-    if (
-      !res.writableEnded &&
-      !res.destroyed &&
-      res.writable
-    ) {
-      res.write(data);
-      return true;
-    }
-  } catch (error) {
-    console.warn(
-      '[STREAM] Write failed:',
-      error.message
-    );
-  }
-
-  return false;
-}
-
-function clamp(value, min, max) {
-  return Math.min(
-    Math.max(value, min),
-    max
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Retry / backoff
-// ---------------------------------------------------------------------------
-
-const RETRYABLE_STATUS_CODES =
-  new Set([
-    429,
-    502,
-    503,
-    504
-  ]);
+// ===========================================================================
+// RETRY / BACKOFF
+// ===========================================================================
 
 function parseRetryAfter(value) {
   if (!value) {
@@ -947,8 +979,7 @@ function parseRetryAfter(value) {
   }
 
   // Retry-After: <seconds>
-  const seconds =
-    Number(value);
+  const seconds = Number(value);
 
   if (
     Number.isFinite(seconds) &&
@@ -958,8 +989,7 @@ function parseRetryAfter(value) {
   }
 
   // Retry-After: HTTP-date
-  const timestamp =
-    Date.parse(value);
+  const timestamp = Date.parse(value);
 
   if (!Number.isNaN(timestamp)) {
     return Math.max(
@@ -977,20 +1007,19 @@ function calculateBackoff(
   policy,
   retryAfterHeader
 ) {
-  const serverError =
-    status >= 500;
-
   const base =
     status === 429
       ? policy.rateLimitBaseDelayMs
       : policy.serverBaseDelayMs;
 
-  // Respect Retry-After when provided.
   const retryAfter =
     parseRetryAfter(
       retryAfterHeader
     );
 
+  // Retry-After is authoritative enough to prefer it,
+  // but still add small jitter so multiple clients don't
+  // wake up simultaneously.
   if (retryAfter !== null) {
     return clamp(
       retryAfter +
@@ -1003,15 +1032,6 @@ function calculateBackoff(
     );
   }
 
-  // Exponential backoff:
-  //
-  // attempt 0:
-  //   base
-  //
-  // attempt 1:
-  //   base * 2
-  //
-  // etc.
   const exponential =
     base *
     Math.pow(2, attempt);
@@ -1061,6 +1081,10 @@ async function postNIM(
   const responseType =
     options.responseType || 'json';
 
+  const timeout =
+    options.timeout ||
+    REQUEST_TIMEOUT_MS;
+
   for (
     let attempt = 0;
     attempt <= policy.retryCount;
@@ -1081,12 +1105,10 @@ async function postNIM(
               'application/json'
           },
 
-          timeout:
-            options.timeout ||
-            REQUEST_TIMEOUT_MS,
+          timeout,
 
-          // Let us handle retryable status codes
-          // ourselves.
+          // Make Axios reject non-2xx responses so
+          // the retry logic can inspect them.
           validateStatus: status =>
             status >= 200 &&
             status < 300
@@ -1140,9 +1162,9 @@ async function postNIM(
   );
 }
 
-// ---------------------------------------------------------------------------
-// FASTCRW tool
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// FASTCRW TOOL DEFINITION
+// ===========================================================================
 
 const FASTCRW_TOOLS = [
   {
@@ -1152,25 +1174,12 @@ const FASTCRW_TOOLS = [
       name: 'search_web',
 
       description:
-        'Search the web for information that is genuinely unavailable ' +
-        'from the conversation or model knowledge. ' +
-
-        'Use this tool only when external information is necessary. ' +
-
-        'Do NOT search for casual conversation, creative writing, roleplay, ' +
-        'brainstorming, opinions, explanations that can be answered directly, ' +
-        'or information already present in the conversation. ' +
-
-        'Prefer ONE focused query that addresses the missing information. ' +
-
-        'After receiving results, inspect them before deciding whether another ' +
-        'search is actually necessary. ' +
-
-        'Do not repeat the same query or make trivial variations of it. ' +
-
-        'If the existing search results are sufficient, answer immediately. ' +
-
-        'A maximum search budget applies to the entire request.',
+        'Search the web only when external information is genuinely necessary. ' +
+        'Do not search for casual conversation, creative writing, roleplay, ' +
+        'brainstorming, opinions, or information already available in context. ' +
+        'Prefer ONE focused query. Inspect the returned results before searching again. ' +
+        'Do not repeat or trivially vary an existing query. ' +
+        'A strict search budget applies to the entire request.',
 
       parameters: {
         type: 'object',
@@ -1181,7 +1190,7 @@ const FASTCRW_TOOLS = [
 
             description:
               'One focused search query. ' +
-              'Avoid multiple unrelated questions in one query.'
+              'Avoid multiple unrelated questions.'
           },
 
           limit: {
@@ -1222,9 +1231,9 @@ const FASTCRW_TOOLS = [
   }
 ];
 
-// ---------------------------------------------------------------------------
-// FASTCRW search pacing
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// FASTCRW SEARCH PACING
+// ===========================================================================
 
 async function waitForSearchCooldown(
   lastSearchAt
@@ -1245,9 +1254,9 @@ async function waitForSearchCooldown(
   }
 }
 
-// ---------------------------------------------------------------------------
-// FASTCRW duplicate / near-duplicate detection
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// FASTCRW QUERY SIMILARITY
+// ===========================================================================
 
 function tokenizeQuery(query) {
   return new Set(
@@ -1303,7 +1312,6 @@ function isDuplicateOrSimilarQuery(
     const previousNormalized =
       normalizeSearchQuery(previous);
 
-    // Exact duplicate.
     if (
       normalized ===
       previousNormalized
@@ -1311,11 +1319,6 @@ function isDuplicateOrSimilarQuery(
       return true;
     }
 
-    // Near duplicate.
-    //
-    // 0.8 is intentionally fairly high.
-    // We don't want to reject legitimately different
-    // searches that merely share a few words.
     if (
       querySimilarity(
         normalized,
@@ -1329,23 +1332,24 @@ function isDuplicateOrSimilarQuery(
   return false;
 }
 
-// ---------------------------------------------------------------------------
-// FASTCRW request
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// FASTCRW REQUEST
+// ===========================================================================
 
 async function fastcrwSearch(
   query,
   limit = 3,
   timeRange = 'any'
 ) {
+  const safeLimit = clamp(
+    Number(limit) || 3,
+    1,
+    MAX_SEARCH_RESULTS
+  );
+
   const params = {
     q: query,
-
-    limit: clamp(
-      Number(limit) || 3,
-      1,
-      5
-    )
+    limit: safeLimit
   };
 
   if (
@@ -1372,7 +1376,11 @@ async function fastcrwSearch(
           },
 
           timeout:
-            FASTCRW_TIMEOUT_MS
+            FASTCRW_TIMEOUT_MS,
+
+          validateStatus: status =>
+            status >= 200 &&
+            status < 300
         }
       );
 
@@ -1396,9 +1404,9 @@ async function fastcrwSearch(
   }
 }
 
-// ---------------------------------------------------------------------------
-// Tool-call helpers
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// TOOL CALL HELPERS
+// ===========================================================================
 
 function makeToolResult(
   toolCallId,
@@ -1411,27 +1419,89 @@ function makeToolResult(
   };
 }
 
-function normalizeSearchQuery(query) {
-  return String(query || '')
-    .toLowerCase()
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
 function parseToolArguments(toolCall) {
   try {
-    return JSON.parse(
+    const raw =
       toolCall.function?.arguments ||
-        '{}'
-    );
+      '{}';
+
+    const parsed =
+      JSON.parse(raw);
+
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      Array.isArray(parsed)
+    ) {
+      return null;
+    }
+
+    return parsed;
   } catch {
     return null;
   }
 }
 
-// ---------------------------------------------------------------------------
-// FASTCRW tool loop
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// FASTCRW SYNTHESIS
+// ===========================================================================
+//
+// Once the search budget / round budget is reached, explicitly remove tools.
+// This prevents the "final answer" request from immediately deciding that it
+// needs another search.
+// ===========================================================================
+
+async function runSynthesisRequest({
+  selectedModel,
+  messages,
+  temperature,
+  max_tokens,
+  enableThinking,
+  reasoningEffort
+}) {
+  const reasoningPayload =
+    getReasoningPayload(
+      selectedModel,
+      enableThinking,
+      reasoningEffort,
+      false
+    );
+
+  const requestBody = {
+    model: selectedModel,
+
+    messages,
+
+    temperature:
+      temperature ?? 0.7,
+
+    max_tokens:
+      Math.min(
+        max_tokens ??
+          FASTCRW_MAX_TOKENS,
+        FASTCRW_MAX_TOKENS
+      ),
+
+    stream: false,
+
+    ...reasoningPayload
+  };
+
+  console.log(
+    `[FASTCRW] Final synthesis with ${selectedModel}`
+  );
+
+  const response =
+    await postNIM(
+      requestBody
+    );
+
+  return response.data;
+}
+
+// ===========================================================================
+// FASTCRW TOOL LOOP
+// ===========================================================================
 
 async function runWithWebSearch({
   selectedModel,
@@ -1459,17 +1529,15 @@ async function runWithWebSearch({
     round++
   ) {
     console.log(
-      `[FASTCRW] Tool round ${round + 1}/${MAX_TOOL_ROUNDS} ` +
+      `[FASTCRW] Round ${round + 1}/${MAX_TOOL_ROUNDS} ` +
       `| searches ${totalSearches}/${MAX_SEARCHES_PER_REQUEST}`
     );
 
-    const reasoningPayload =
-      getReasoningPayload(
-        selectedModel,
-        enableThinking,
-        reasoningEffort,
-        true
-      );
+    // Once the global search budget has been exhausted,
+    // don't even advertise the tool anymore.
+    const canSearch =
+      totalSearches <
+      MAX_SEARCHES_PER_REQUEST;
 
     const requestBody = {
       model: selectedModel,
@@ -1489,34 +1557,20 @@ async function runWithWebSearch({
 
       stream: false,
 
-      tools:
-        FASTCRW_TOOLS,
-
-      tool_choice: 'auto',
-
-      ...reasoningPayload
+      ...getReasoningPayload(
+        selectedModel,
+        enableThinking,
+        reasoningEffort,
+        canSearch
+      )
     };
 
-    // ---------------------------------------------------------------
-    // Hard search budget.
-    //
-    // Once the budget is exhausted, tools disappear.
-    //
-    // Unlike the previous version, this happens only after the
-    // configured search budget has actually been consumed.
-    // ---------------------------------------------------------------
+    if (canSearch) {
+      requestBody.tools =
+        FASTCRW_TOOLS;
 
-    if (
-      totalSearches >=
-      MAX_SEARCHES_PER_REQUEST
-    ) {
-      delete requestBody.tools;
-      delete requestBody.tool_choice;
-
-      console.log(
-        '[FASTCRW] Search budget exhausted. ' +
-        'Forcing final answer.'
-      );
+      requestBody.tool_choice =
+        'auto';
     }
 
     const response =
@@ -1530,6 +1584,10 @@ async function runWithWebSearch({
         ?.message;
 
     if (!assistantMessage) {
+      console.warn(
+        '[FASTCRW] NIM returned no assistant message.'
+      );
+
       return response.data;
     }
 
@@ -1540,33 +1598,22 @@ async function runWithWebSearch({
         ? assistantMessage.tool_calls
         : [];
 
-    // ---------------------------------------------------------------
-    // Normal answer.
-    // ---------------------------------------------------------------
-
-    if (
-      toolCalls.length === 0
-    ) {
+    // Model answered directly.
+    if (toolCalls.length === 0) {
       return response.data;
     }
 
-    // Preserve assistant's tool call.
     workingMessages.push(
       assistantMessage
     );
 
     let searchesThisRound = 0;
 
-    for (
-      const toolCall of toolCalls
-    ) {
+    for (const toolCall of toolCalls) {
       const functionName =
         toolCall.function?.name;
 
-      // -------------------------------------------------------------
       // Unknown tool.
-      // -------------------------------------------------------------
-
       if (
         functionName !==
         'search_web'
@@ -1576,7 +1623,6 @@ async function runWithWebSearch({
             toolCall.id,
             {
               success: false,
-
               error:
                 `Unknown tool: ${functionName}`
             }
@@ -1586,10 +1632,7 @@ async function runWithWebSearch({
         continue;
       }
 
-      // -------------------------------------------------------------
-      // Global search limit.
-      // -------------------------------------------------------------
-
+      // Global limit.
       if (
         totalSearches >=
         MAX_SEARCHES_PER_REQUEST
@@ -1601,7 +1644,7 @@ async function runWithWebSearch({
               success: false,
 
               error:
-                'The maximum number of web searches for this request has been reached. ' +
+                'The web-search budget has been exhausted. ' +
                 'Use the information already gathered and answer the user.'
             }
           )
@@ -1610,10 +1653,7 @@ async function runWithWebSearch({
         continue;
       }
 
-      // -------------------------------------------------------------
-      // Per-round search limit.
-      // -------------------------------------------------------------
-
+      // Per-round limit.
       if (
         searchesThisRound >=
         MAX_SEARCH_CALLS_PER_ROUND
@@ -1625,18 +1665,14 @@ async function runWithWebSearch({
               success: false,
 
               error:
-                'Only one focused web search is permitted in this tool round. ' +
-                'Use the available search results.'
+                'Only one focused web search is allowed in this round. ' +
+                'Inspect the existing results instead.'
             }
           )
         );
 
         continue;
       }
-
-      // -------------------------------------------------------------
-      // Parse arguments.
-      // -------------------------------------------------------------
 
       const args =
         parseToolArguments(
@@ -1649,7 +1685,6 @@ async function runWithWebSearch({
             toolCall.id,
             {
               success: false,
-
               error:
                 'Invalid search tool arguments.'
             }
@@ -1658,10 +1693,6 @@ async function runWithWebSearch({
 
         continue;
       }
-
-      // -------------------------------------------------------------
-      // Validate query.
-      // -------------------------------------------------------------
 
       const query =
         cleanSearchQuery(
@@ -1687,10 +1718,7 @@ async function runWithWebSearch({
         continue;
       }
 
-      // -------------------------------------------------------------
-      // Duplicate / near-duplicate protection.
-      // -------------------------------------------------------------
-
+      // Duplicate protection.
       if (
         isDuplicateOrSimilarQuery(
           query,
@@ -1698,7 +1726,7 @@ async function runWithWebSearch({
         )
       ) {
         console.log(
-          `[FASTCRW] Blocked duplicate/near-duplicate query: ${query}`
+          `[FASTCRW] Blocked duplicate query: "${query}"`
         );
 
         workingMessages.push(
@@ -1709,17 +1737,13 @@ async function runWithWebSearch({
 
               error:
                 'A substantially identical search has already been performed. ' +
-                'Use those results instead of repeating the search.'
+                'Use those results instead of searching again.'
             }
           )
         );
 
         continue;
       }
-
-      // -------------------------------------------------------------
-      // Validate result count.
-      // -------------------------------------------------------------
 
       const limit =
         clamp(
@@ -1728,43 +1752,36 @@ async function runWithWebSearch({
           MAX_SEARCH_RESULTS
         );
 
+      const allowedTimeRanges = new Set([
+        'hour',
+        'day',
+        'week',
+        'month',
+        'year',
+        'any'
+      ]);
+
       const timeRange =
-        [
-          'hour',
-          'day',
-          'week',
-          'month',
-          'year',
-          'any'
-        ].includes(
+        allowedTimeRanges.has(
           args.time_range
         )
           ? args.time_range
           : 'any';
 
-      // -------------------------------------------------------------
-      // Search pacing.
-      // -------------------------------------------------------------
-
+      // Pace searches.
       await waitForSearchCooldown(
         lastSearchAt
       );
 
-      lastSearchAt =
-        Date.now();
-
-      // -------------------------------------------------------------
-      // Execute search.
-      // -------------------------------------------------------------
+      // Mark the search time immediately before
+      // making the request, not after it.
+      lastSearchAt = Date.now();
 
       totalSearches++;
       searchesThisRound++;
 
-      searchedQueries.push(
-        query
-      );
+      searchedQueries.push(query);
 
-      // Keep history bounded.
       if (
         searchedQueries.length >
         MAX_QUERY_HISTORY
@@ -1813,57 +1830,24 @@ async function runWithWebSearch({
       }
     }
 
-    // ---------------------------------------------------------------
-    // If we still have search budget, allow the model to inspect
-    // the results and decide whether another search is genuinely
-    // necessary.
+    // Let the model inspect the search result and decide
+    // whether it genuinely needs another search.
     //
-    // This is the key difference from the previous implementation.
-    // ---------------------------------------------------------------
-
+    // The next round is still subject to both hard limits.
     if (
       totalSearches <
-      MAX_SEARCHES_PER_REQUEST
+        MAX_SEARCHES_PER_REQUEST &&
+      round + 1 <
+        MAX_TOOL_ROUNDS
     ) {
       continue;
     }
 
-    // ---------------------------------------------------------------
-    // Search budget exhausted.
-    //
-    // Force a final tool-free synthesis request.
-    // ---------------------------------------------------------------
-
-    console.log(
-      '[FASTCRW] Search budget exhausted. ' +
-      'Starting final synthesis.'
-    );
-
-    return runSynthesisRequest({
-      selectedModel,
-
-      messages:
-        workingMessages,
-
-      temperature,
-
-      max_tokens,
-
-      enableThinking,
-
-      reasoningEffort
-    });
+    break;
   }
 
-  // -----------------------------------------------------------------
-  // Tool rounds exhausted before search budget was exhausted.
-  //
-  // This prevents a model from using an unlimited number of tool
-  // rounds even when the search count itself is still below the cap.
-  // -----------------------------------------------------------------
-
   console.log(
-    '[FASTCRW] Tool-round limit reached. ' +
+    '[FASTCRW] Search/tool budget exhausted. ' +
     'Starting final synthesis.'
   );
 
@@ -1883,9 +1867,9 @@ async function runWithWebSearch({
   });
 }
 
-// ---------------------------------------------------------------------------
-// Standard NIM completion
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// STANDARD NIM COMPLETION
+// ===========================================================================
 
 async function callNIM({
   selectedModel,
@@ -1897,14 +1881,6 @@ async function callNIM({
   reasoningEffort,
   hasTools
 }) {
-  const reasoningPayload =
-    getReasoningPayload(
-      selectedModel,
-      enableThinking,
-      reasoningEffort,
-      hasTools
-    );
-
   const requestBody = {
     model: selectedModel,
 
@@ -1923,7 +1899,12 @@ async function callNIM({
     stream:
       Boolean(stream),
 
-    ...reasoningPayload
+    ...getReasoningPayload(
+      selectedModel,
+      enableThinking,
+      reasoningEffort,
+      hasTools
+    )
   };
 
   console.log(
@@ -1947,9 +1928,9 @@ async function callNIM({
   };
 }
 
-// ---------------------------------------------------------------------------
-// OpenAI response normalization
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// OPENAI RESPONSE NORMALIZATION
+// ===========================================================================
 
 function buildOpenAIResponse(
   nimData,
@@ -1958,14 +1939,14 @@ function buildOpenAIResponse(
 ) {
   return {
     id:
-      nimData.id ||
+      nimData?.id ||
       `chatcmpl-${Date.now()}`,
 
     object:
       'chat.completion',
 
     created:
-      nimData.created ||
+      nimData?.created ||
       Math.floor(
         Date.now() / 1000
       ),
@@ -1975,20 +1956,23 @@ function buildOpenAIResponse(
       actualModel,
 
     choices:
-      (nimData.choices || [])
-        .map(
-          (choice, index) => ({
-            ...normalizeNonStreamChoice(
-              choice,
-              actualModel
-            ),
+      Array.isArray(
+        nimData?.choices
+      )
+        ? nimData.choices.map(
+            (choice, index) => ({
+              ...normalizeNonStreamChoice(
+                choice,
+                actualModel
+              ),
 
-            index
-          })
-        ),
+              index
+            })
+          )
+        : [],
 
     usage:
-      nimData.usage || {
+      nimData?.usage || {
         prompt_tokens: 0,
         completion_tokens: 0,
         total_tokens: 0
@@ -2001,14 +1985,16 @@ function applyReasoningVisibility(
   inlineReasoning
 ) {
   const finalMessage = {
-    ...message
+    ...(message || {})
   };
 
   const reasoning =
-    finalMessage.reasoning || '';
+    finalMessage.reasoning ||
+    '';
 
   let content =
-    finalMessage.content || '';
+    finalMessage.content ||
+    '';
 
   if (
     SHOW_REASONING &&
@@ -2022,7 +2008,10 @@ function applyReasoningVisibility(
   finalMessage.content =
     content;
 
-  if (SHOW_REASONING && reasoning) {
+  if (
+    SHOW_REASONING &&
+    reasoning
+  ) {
     finalMessage.reasoning =
       reasoning;
 
@@ -2036,9 +2025,9 @@ function applyReasoningVisibility(
   return finalMessage;
 }
 
-// ---------------------------------------------------------------------------
-// SSE helpers
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// SSE HELPERS
+// ===========================================================================
 
 function setSSEHeaders(res) {
   res.setHeader(
@@ -2048,7 +2037,7 @@ function setSSEHeaders(res) {
 
   res.setHeader(
     'Cache-Control',
-    'no-cache'
+    'no-cache, no-transform'
   );
 
   res.setHeader(
@@ -2056,14 +2045,16 @@ function setSSEHeaders(res) {
     'keep-alive'
   );
 
-  // Useful for reverse proxies.
   res.setHeader(
     'X-Accel-Buffering',
     'no'
   );
 }
 
-function sendSSE(res, payload) {
+function sendSSE(
+  res,
+  payload
+) {
   return safeWrite(
     res,
     `data: ${JSON.stringify(payload)}\n\n`
@@ -2077,30 +2068,30 @@ function sendDone(res) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// FASTCRW response -> SSE
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// FASTCRW COMPLETED RESPONSE -> SSE
+// ===========================================================================
 
 function streamCompletedResponse(
   res,
   responseData
 ) {
   const id =
-    responseData.id ||
+    responseData?.id ||
     `chatcmpl-${Date.now()}`;
 
   const created =
-    responseData.created ||
+    responseData?.created ||
     Math.floor(
       Date.now() / 1000
     );
 
   const model =
-    responseData.model ||
+    responseData?.model ||
     'unknown';
 
   const choice =
-    responseData.choices?.[0];
+    responseData?.choices?.[0];
 
   sendSSE(res, {
     id,
@@ -2184,9 +2175,9 @@ function streamCompletedResponse(
   }
 }
 
-// ---------------------------------------------------------------------------
-// Streaming NIM response
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// NIM STREAM HANDLER
+// ===========================================================================
 
 function handleNIMStream({
   req,
@@ -2199,17 +2190,16 @@ function handleNIMStream({
   const decoder =
     new StringDecoder('utf8');
 
-  let buffer = '';
-  let doneSent = false;
-  let cleanEnd = false;
-  let cleanedUp = false;
-
-  let reasoningOpen = false;
-
   const normalizer =
     new StreamNormalizer(
       usedModel
     );
+
+  let buffer = '';
+  let doneSent = false;
+  let cleanEnd = false;
+  let cleanedUp = false;
+  let reasoningOpen = false;
 
   const cleanup = () => {
     if (cleanedUp) {
@@ -2244,19 +2234,39 @@ function handleNIMStream({
     cleanup();
   };
 
+  const sendStreamError = (
+    message,
+    type = 'stream_error'
+  ) => {
+    if (res.writableEnded) {
+      return;
+    }
+
+    sendSSE(res, {
+      error: {
+        message,
+        type
+      }
+    });
+  };
+
   const processLine = line => {
+    // SSE comments / blank lines.
     if (
-      !line.startsWith('data: ')
+      !line ||
+      !line.startsWith('data:')
     ) {
       return;
     }
 
     const raw =
-      line.slice(6).trim();
+      line.slice(5).trim();
 
-    if (
-      raw === '[DONE]'
-    ) {
+    if (!raw) {
+      return;
+    }
+
+    if (raw === '[DONE]') {
       finish();
       return;
     }
@@ -2266,7 +2276,7 @@ function handleNIMStream({
         JSON.parse(raw);
 
       const delta =
-        data.choices?.[0]?.delta;
+        data?.choices?.[0]?.delta;
 
       if (!delta) {
         sendSSE(
@@ -2282,8 +2292,7 @@ function handleNIMStream({
           delta
         );
 
-      let clientContent =
-        '';
+      let clientContent = '';
 
       if (
         SHOW_REASONING &&
@@ -2312,80 +2321,71 @@ function handleNIMStream({
         }
       }
 
-      // Never mutate the upstream object directly.
-      const outputData = {
-        ...data,
-
-        choices:
-          data.choices.map(
-            (choice, index) => {
-              if (index !== 0) {
-                return choice;
-              }
-
-              return {
-                ...choice,
-
-                delta: {
-                  ...choice.delta,
-
-                  content:
-                    clientContent
+      const outputChoices =
+        Array.isArray(data.choices)
+          ? data.choices.map(
+              (choice, index) => {
+                if (index !== 0) {
+                  return choice;
                 }
-              };
-            }
-          )
-      };
 
-      if (
-        SHOW_REASONING &&
-        normalized.reasoning
-      ) {
-        outputData.choices[0]
-          .delta.reasoning =
-            normalized.reasoning;
+                const outputDelta = {
+                  ...(choice.delta || {})
+                };
 
-        outputData.choices[0]
-          .delta.reasoning_content =
-            normalized.reasoning;
-      } else {
-        delete outputData
-          .choices[0]
-          .delta.reasoning;
+                if (clientContent) {
+                  outputDelta.content =
+                    clientContent;
+                } else {
+                  delete outputDelta.content;
+                }
 
-        delete outputData
-          .choices[0]
-          .delta.reasoning_content;
-      }
+                if (
+                  SHOW_REASONING &&
+                  normalized.reasoning
+                ) {
+                  outputDelta.reasoning =
+                    normalized.reasoning;
 
-      sendSSE(
-        res,
-        outputData
-      );
+                  outputDelta.reasoning_content =
+                    normalized.reasoning;
+                } else {
+                  delete outputDelta.reasoning;
+                  delete outputDelta.reasoning_content;
+                }
+
+                return {
+                  ...choice,
+                  delta: outputDelta
+                };
+              }
+            )
+          : [];
+
+      sendSSE(res, {
+        ...data,
+        choices: outputChoices
+      });
     } catch (error) {
       console.warn(
         '[STREAM] Invalid JSON chunk:',
         raw.slice(0, 100)
       );
 
-      sendSSE(res, {
-        error: {
-          message:
-            'Upstream sent malformed chunk',
-
-          type:
-            'stream_parse_error',
-
-          details:
-            raw.slice(0, 100)
-        }
-      });
+      sendStreamError(
+        'Upstream sent malformed chunk',
+        'stream_parse_error'
+      );
     }
   };
 
   upstreamStream.on(
     'data',
     chunk => {
+      if (doneSent) {
+        return;
+      }
+
       buffer +=
         decoder.write(chunk);
 
@@ -2397,40 +2397,29 @@ function handleNIMStream({
           '[STREAM] Buffer overflow.'
         );
 
-        sendSSE(res, {
-          error: {
-            message:
-              'Stream buffer overflow',
-
-            type:
-              'stream_error'
-          }
-        });
-
-        sendDone(res);
-
-        doneSent = true;
-
-        if (!res.writableEnded) {
-          res.end();
-        }
+        sendStreamError(
+          'Stream buffer overflow'
+        );
 
         upstreamStream.destroy();
-        cleanup();
+
+        finish();
 
         return;
       }
 
       const lines =
-        buffer.split('\n');
+        buffer.split(/\r?\n/);
 
       buffer =
         lines.pop() || '';
 
       for (const line of lines) {
-        processLine(
-          line.replace(/\r$/, '')
-        );
+        processLine(line);
+
+        if (doneSent) {
+          break;
+        }
       }
     }
   );
@@ -2438,17 +2427,23 @@ function handleNIMStream({
   upstreamStream.on(
     'end',
     () => {
+      if (doneSent) {
+        return;
+      }
+
       buffer +=
         decoder.end();
 
-      if (buffer.trim()) {
+      if (buffer) {
         for (
           const line of
-          buffer.split('\n')
+          buffer.split(/\r?\n/)
         ) {
-          processLine(
-            line.replace(/\r$/, '')
-          );
+          processLine(line);
+
+          if (doneSent) {
+            return;
+          }
         }
       }
 
@@ -2459,8 +2454,7 @@ function handleNIMStream({
       const flushed =
         normalizer.flush();
 
-      let finalContent =
-        '';
+      let finalContent = '';
 
       if (
         SHOW_REASONING &&
@@ -2493,10 +2487,14 @@ function handleNIMStream({
         sendSSE(res, {
           choices: [
             {
+              index: 0,
+
               delta: {
                 content:
                   finalContent
-              }
+              },
+
+              finish_reason: null
             }
           ]
         });
@@ -2515,15 +2513,9 @@ function handleNIMStream({
       );
 
       if (!res.writableEnded) {
-        sendSSE(res, {
-          error: {
-            message:
-              'Stream interrupted by upstream error',
-
-            type:
-              'stream_error'
-          }
-        });
+        sendStreamError(
+          'Stream interrupted by upstream error'
+        );
 
         if (!doneSent) {
           sendDone(res);
@@ -2540,9 +2532,7 @@ function handleNIMStream({
   req.on(
     'close',
     () => {
-      if (
-        !cleanEnd
-      ) {
+      if (!cleanEnd) {
         console.warn(
           '[STREAM] Client disconnected.'
         );
@@ -2561,9 +2551,9 @@ function handleNIMStream({
   );
 }
 
-// ---------------------------------------------------------------------------
-// Model validation
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// MODEL VALIDATION
+// ===========================================================================
 
 async function validateModels() {
   if (SKIP_VALIDATION) {
@@ -2592,14 +2582,23 @@ async function validateModels() {
           },
 
           timeout:
-            VALIDATION_TIMEOUT_MS
+            VALIDATION_TIMEOUT_MS,
+
+          validateStatus: status =>
+            status >= 200 &&
+            status < 300
         }
       );
 
     const available =
       new Set(
-        (response.data?.data || [])
-          .map(model => model.id)
+        Array.isArray(
+          response.data?.data
+        )
+          ? response.data.data
+              .map(model => model.id)
+              .filter(Boolean)
+          : []
       );
 
     const invalid = [];
@@ -2646,16 +2645,27 @@ async function validateModels() {
       `[VALIDATION] Model check failed: ${error.message}`
     );
 
+    // Validation is deliberately non-fatal.
+    // A temporary NIM /models failure should not
+    // prevent the proxy itself from starting.
     console.warn(
       '[VALIDATION] Continuing without validation.'
     );
   }
 }
 
+// ===========================================================================
+// DISCORD ALERT
+// ===========================================================================
+
 async function sendDiscordAlert(
   invalidModels
 ) {
-  if (!DISCORD_WEBHOOK_URL) {
+  if (
+    !DISCORD_WEBHOOK_URL ||
+    !Array.isArray(invalidModels) ||
+    !invalidModels.length
+  ) {
     return;
   }
 
@@ -2693,7 +2703,11 @@ async function sendDiscordAlert(
           'NIM Proxy Monitor'
       },
       {
-        timeout: 5000
+        timeout: 5000,
+
+        validateStatus: status =>
+          status >= 200 &&
+          status < 300
       }
     );
 
@@ -2708,27 +2722,82 @@ async function sendDiscordAlert(
   }
 }
 
-// ---------------------------------------------------------------------------
-// Health
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// ERROR HELPERS
+// ===========================================================================
+
+function getUpstreamErrorMessage(
+  error
+) {
+  const upstreamMessage =
+    error.response?.data?.error?.message ||
+    error.response?.data?.message;
+
+  if (typeof upstreamMessage === 'string') {
+    return upstreamMessage;
+  }
+
+  return error.message ||
+    'Upstream request failed.';
+}
+
+function sendProxyError(
+  res,
+  error,
+  fallbackStatus = 500
+) {
+  if (res.headersSent) {
+    return false;
+  }
+
+  const status =
+    Number(error.response?.status) ||
+    fallbackStatus;
+
+  return res
+    .status(status)
+    .json({
+      error: {
+        message:
+          getUpstreamErrorMessage(
+            error
+          ),
+
+        type:
+          'proxy_error',
+
+        code:
+          status
+      }
+    });
+}
+
+// ===========================================================================
+// HEALTH
+// ===========================================================================
 
 app.get(
   '/health',
   (req, res) => {
     res.json({
       status: 'ok',
-      version: '4.0.0'
+      version: '4.1.0'
     });
   }
 );
 
-// ---------------------------------------------------------------------------
-// Model list
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// MODEL LIST
+// ===========================================================================
 
 app.get(
   '/v1/models',
   (req, res) => {
+    const created =
+      Math.floor(
+        Date.now() / 1000
+      );
+
     res.json({
       object: 'list',
 
@@ -2741,10 +2810,7 @@ app.get(
           object:
             'model',
 
-          created:
-            Math.floor(
-              Date.now() / 1000
-            ),
+          created,
 
           owned_by:
             'nim-proxy'
@@ -2753,9 +2819,9 @@ app.get(
   }
 );
 
-// ---------------------------------------------------------------------------
-// Main chat completion route
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// MAIN CHAT COMPLETION ROUTE
+// ===========================================================================
 
 app.post(
   '/v1/chat/completions',
@@ -2763,17 +2829,20 @@ app.post(
     let upstreamStream = null;
 
     try {
+      const body =
+        req.body || {};
+
       const {
         model,
         messages,
         temperature,
         max_tokens,
         stream
-      } = req.body;
+      } = body;
 
-      // ---------------------------------------------------------------
-      // Request validation
-      // ---------------------------------------------------------------
+      // ---------------------------------------------------------------------
+      // Validate request
+      // ---------------------------------------------------------------------
 
       if (
         !Array.isArray(messages)
@@ -2782,6 +2851,20 @@ app.post(
           error: {
             message:
               'messages must be an array',
+
+            type:
+              'invalid_request_error',
+
+            code: 400
+          }
+        });
+      }
+
+      if (!model) {
+        return res.status(400).json({
+          error: {
+            message:
+              'model is required',
 
             type:
               'invalid_request_error',
@@ -2812,16 +2895,16 @@ app.post(
         `[PROXY] ${model} → ${selectedModel}`
       );
 
-      // ---------------------------------------------------------------
+      // ---------------------------------------------------------------------
       // Reasoning settings
-      // ---------------------------------------------------------------
+      // ---------------------------------------------------------------------
 
       const enableThinking =
         ENABLE_THINKING_MODE;
 
       const reasoningEffort =
-        req.body.reasoning_effort ||
-        req.body.reasoningEffort ||
+        body.reasoning_effort ||
+        body.reasoningEffort ||
         undefined;
 
       const inlineReasoning =
@@ -2829,9 +2912,17 @@ app.post(
           'x-reasoning-format'
         ] === 'inline';
 
-      // ---------------------------------------------------------------
+      const wantsStream =
+        Boolean(stream);
+
+      // ---------------------------------------------------------------------
       // FASTCRW
-      // ---------------------------------------------------------------
+      //
+      // Important:
+      // FASTCRW itself is non-streaming internally.
+      // Once the final answer is produced, it can still be emitted as
+      // an OpenAI-compatible SSE response to clients requesting stream=true.
+      // ---------------------------------------------------------------------
 
       if (ENABLE_WEB_SEARCH) {
         const result =
@@ -2856,7 +2947,6 @@ app.post(
             selectedModel
           );
 
-        // Apply reasoning visibility.
         response.choices =
           response.choices.map(
             choice => ({
@@ -2870,7 +2960,7 @@ app.post(
             })
           );
 
-        if (!stream) {
+        if (!wantsStream) {
           return res.json(
             response
           );
@@ -2884,9 +2974,9 @@ app.post(
         return;
       }
 
-      // ---------------------------------------------------------------
+      // ---------------------------------------------------------------------
       // Normal NIM request
-      // ---------------------------------------------------------------
+      // ---------------------------------------------------------------------
 
       const result =
         await callNIM({
@@ -2898,7 +2988,8 @@ app.post(
 
           max_tokens,
 
-          stream,
+          stream:
+            wantsStream,
 
           enableThinking,
 
@@ -2910,11 +3001,11 @@ app.post(
       upstreamStream =
         result.response.data;
 
-      // ---------------------------------------------------------------
+      // ---------------------------------------------------------------------
       // Non-streaming
-      // ---------------------------------------------------------------
+      // ---------------------------------------------------------------------
 
-      if (!stream) {
+      if (!wantsStream) {
         const response =
           buildOpenAIResponse(
             result.response.data,
@@ -2940,9 +3031,9 @@ app.post(
         );
       }
 
-      // ---------------------------------------------------------------
+      // ---------------------------------------------------------------------
       // Streaming
-      // ---------------------------------------------------------------
+      // ---------------------------------------------------------------------
 
       return handleNIMStream({
         req,
@@ -2954,7 +3045,6 @@ app.post(
         usedModel:
           result.usedModel
       });
-
     } catch (error) {
       console.error(
         '[PROXY] Request failed:',
@@ -2968,51 +3058,41 @@ app.post(
         );
       }
 
-      // ---------------------------------------------------------------
-      // Normal HTTP error
-      // ---------------------------------------------------------------
+      // ---------------------------------------------------------------------
+      // Error before SSE headers were sent
+      // ---------------------------------------------------------------------
 
       if (!res.headersSent) {
-        const status =
-          error.response?.status ||
-          500;
-
-        return res
-          .status(status)
-          .json({
-            error: {
-              message:
-                error.message,
-
-              type:
-                'proxy_error',
-
-              code:
-                status
-            }
-          });
+        return sendProxyError(
+          res,
+          error
+        );
       }
 
-      // ---------------------------------------------------------------
+      // ---------------------------------------------------------------------
       // Error after SSE started
-      // ---------------------------------------------------------------
+      // ---------------------------------------------------------------------
 
-      if (
-        !res.writableEnded
-      ) {
+      if (!res.writableEnded) {
         sendSSE(res, {
           error: {
             message:
-              error.message,
+              getUpstreamErrorMessage(
+                error
+              ),
 
             type:
               'proxy_error'
           }
         });
 
-        sendDone(res);
+        if (!res.writableEnded) {
+          sendDone(res);
+        }
 
-        res.end();
+        if (!res.writableEnded) {
+          res.end();
+        }
       }
 
       if (
@@ -3025,9 +3105,9 @@ app.post(
   }
 );
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // 404
-// ---------------------------------------------------------------------------
+// ===========================================================================
 
 app.use(
   (req, res) => {
@@ -3045,9 +3125,38 @@ app.use(
   }
 );
 
-// ---------------------------------------------------------------------------
-// Startup
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// EXPRESS ERROR HANDLER
+// ===========================================================================
+
+app.use(
+  (error, req, res, next) => {
+    console.error(
+      '[EXPRESS] Unhandled error:',
+      error.message
+    );
+
+    if (res.headersSent) {
+      return next(error);
+    }
+
+    return res.status(500).json({
+      error: {
+        message:
+          'Internal proxy error',
+
+        type:
+          'proxy_error',
+
+        code: 500
+      }
+    });
+  }
+);
+
+// ===========================================================================
+// STARTUP
+// ===========================================================================
 
 app.listen(
   PORT,
@@ -3061,11 +3170,25 @@ app.listen(
     );
 
     console.log(
-      `[PROXY] FASTCRW: ${ENABLE_WEB_SEARCH ? 'enabled' : 'disabled'}`
+      `[PROXY] FASTCRW: ` +
+      `${ENABLE_WEB_SEARCH ? 'enabled' : 'disabled'}`
     );
 
     console.log(
-      `[PROXY] Retry profiles: default + conservative GLM/M3`
+      `[PROXY] FASTCRW limits: ` +
+      `${MAX_TOOL_ROUNDS} rounds / ` +
+      `${MAX_SEARCHES_PER_REQUEST} searches / ` +
+      `${MAX_SEARCH_CALLS_PER_ROUND} per round`
+    );
+
+    console.log(
+      `[PROXY] Search cooldown: ` +
+      `${MIN_SEARCH_INTERVAL_MS}ms`
+    );
+
+    console.log(
+      '[PROXY] Retry profiles: ' +
+      'default + conservative GLM/M3/Kimi'
     );
 
     validateModels()
