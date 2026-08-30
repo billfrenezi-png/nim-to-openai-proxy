@@ -240,14 +240,14 @@ const CONSERVATIVE_RETRY_POLICY = {
   retryCount: 1,
 
   // Wait longer instead of immediately hitting the endpoint again.
-  serverBaseDelayMs: 4000,
+  serverBaseDelayMs: 5000,
 
   // Rate limits deserve an even longer pause.
-  rateLimitBaseDelayMs: 7000,
+  rateLimitBaseDelayMs: 8000,
 
-  maxDelayMs: 45000,
+  maxDelayMs: 55000,
 
-  jitterMs: 1000
+  jitterMs: 1200
 };
 
 const RETRY_POLICIES = {
