@@ -124,7 +124,7 @@ const MAX_SEARCHES_PER_REQUEST = clamp(
 );
 
 const MAX_SEARCH_CALLS_PER_ROUND = clamp(
-  integerOrDefault(
+  integerOrDefault(https://github.com/billfrenezi-png/nim-to-openai-proxy/blob/main/server.js
     process.env.MAX_SEARCH_CALLS_PER_ROUND,
     1
   ),
@@ -432,9 +432,6 @@ validateConfig();
 // ===========================================================================
 // CORS
 // ===========================================================================
-
-// CORS MUST run before authentication so browser preflight (OPTIONS)
-// requests are not rejected by the Bearer-token middleware.
 
 app.use(cors({
   origin: true,
