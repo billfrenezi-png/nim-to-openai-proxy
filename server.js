@@ -124,7 +124,7 @@ const MAX_SEARCHES_PER_REQUEST = clamp(
 );
 
 const MAX_SEARCH_CALLS_PER_ROUND = clamp(
-  integerOrDefault(https://github.com/billfrenezi-png/nim-to-openai-proxy/blob/main/server.js
+  integerOrDefault(
     process.env.MAX_SEARCH_CALLS_PER_ROUND,
     1
   ),
@@ -429,15 +429,56 @@ function validateConfig() {
 
 validateConfig();
 
-// ===========================================================================
-// CORS
-// ===========================================================================
-
 app.use(cors());
 
 // ===========================================================================
 // AUTHENTICATION
 // ===========================================================================
+
+function extractBearerToken(header) {
+  if (
+    !header ||
+    typeof header !== 'string'
+  ) {
+    return null;
+  }
+
+  const match =
+    header.trim().match(
+      /^Bearer\s+(.+)$/i
+    );
+
+  return match
+    ? match[1]
+    : null;
+}
+
+function safeTimingEqual(a, b) {
+  if (
+    typeof a !== 'string' ||
+    typeof b !== 'string' ||
+    !a ||
+    !b
+  ) {
+    return false;
+  }
+
+  const aBuffer = Buffer.from(a);
+  const bBuffer = Buffer.from(b);
+
+  if (aBuffer.length !== bBuffer.length) {
+    return false;
+  }
+
+  try {
+    return timingSafeEqual(
+      aBuffer,
+      bBuffer
+    );
+  } catch {
+    return false;
+  }
+}
 
 app.use((req, res, next) => {
   // These endpoints intentionally remain public.
