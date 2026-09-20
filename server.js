@@ -218,7 +218,7 @@ const MODEL_MAPPING = {
     'deepseek-ai/deepseek-v4-flash',
 
   'glm-5.2':
-    'z-ai/glm-5.2',
+    'z-ai/glm-5.3',
 
   'mistral':
     'thinkingmachines/inkling',
