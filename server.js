@@ -245,7 +245,7 @@ const MODEL_MAPPING = {
     'google/gemma-3n-e4b-it',
 
   'm3':
-    'minimaxai/minimax-m3',
+    'z-ai/glm-5.3-flash',
 
   'step-3.5-flash':
     'stepfun-ai/step-3.5-flash',
