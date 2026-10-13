@@ -191,7 +191,7 @@ const MODEL_MAPPING = {
     'qwen/qwen3.5-397b-a17b',
 
   'gpt-4-turbo':
-    'z-ai/glm-5.2',
+    'z-ai/glm-5.3-flash',
 
   'gpt-4o':
     'deepseek-ai/deepseek-v4-pro-0813',
@@ -221,7 +221,7 @@ const MODEL_MAPPING = {
     'z-ai/glm-5.3',
 
   'mistral':
-    'thinkingmachines/inkling',
+    'deepseek-ai/deepseek-v4.1-flash',
 
   'mistral-turbo':
     'mistralai/mistral-medium-3.5-128b',
