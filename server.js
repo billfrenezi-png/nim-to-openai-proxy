@@ -182,7 +182,7 @@ const FASTCRW_MAX_TOKENS = clamp(
 
 const MODEL_MAPPING = {
   'gpt-3.5-turbo':
-    'moonshotai/kimi-k3',
+    'minimaxai/minimax-m3.1-flash',
 
   'gpt-4':
     'nvidia/nemotron-3-ultra-550b-a55b',
@@ -290,10 +290,10 @@ const CONSERVATIVE_RETRY_POLICY = Object.freeze({
 });
 
 const RETRY_POLICIES = {
-  'z-ai/glm-5.2':
+  'z-ai/glm-5.3':
     CONSERVATIVE_RETRY_POLICY,
 
-  'minimaxai/minimax-m3':
+  'minimaxai/minimax-m3.1-flash':
     CONSERVATIVE_RETRY_POLICY,
 
   'moonshotai/kimi-k3':
@@ -879,11 +879,10 @@ function getReasoningPayload(
       return payload;
     }
 
-    case 'openai/gpt-oss-120b':
-    case 'openai/gpt-oss-20b': {
+    case 'minimaxai/minimax-m3.1-flash': {
       if (
         effort &&
-        ['low', 'medium', 'high']
+        ['low', 'medium', 'high', 'xhigh', 'max']
           .includes(effort)
       ) {
         return {
@@ -893,7 +892,7 @@ function getReasoningPayload(
 
       if (enableThinking) {
         return {
-          reasoning_effort: 'high'
+          reasoning_effort: 'max'
         };
       }
 
