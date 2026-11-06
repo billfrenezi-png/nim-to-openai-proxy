@@ -10,6 +10,8 @@
 // - FASTCRW web search
 // - Conservative tool loop
 // - Model-aware retry/backoff
+// - Reusable HTTP/TLS connections
+// - Bounded tool-call recovery
 // - Retry-After support
 // - Streaming support
 // - Authentication
@@ -23,9 +25,12 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const http = require('http');
+const https = require('https');
 const { StringDecoder } = require('string_decoder');
 const { timingSafeEqual } = require('crypto');
 
+const APP_VERSION = '4.3.0';
 const app = express();
 
 // ===========================================================================
@@ -34,16 +39,18 @@ const app = express();
 
 const PORT = Number(process.env.PORT || 3000);
 
-const NIM_API_BASE =
+const NIM_API_BASE = (
   process.env.NIM_API_BASE ||
-  'https://integrate.api.nvidia.com/v1';
+  'https://integrate.api.nvidia.com/v1'
+).replace(/\/+$/, '');
 
 const NIM_API_KEY = process.env.NIM_API_KEY;
 const CLIENT_AUTH_KEY = process.env.CLIENT_AUTH_KEY;
 
-const FASTCRW_API_BASE =
+const FASTCRW_API_BASE = (
   process.env.FASTCRW_API_BASE ||
-  'https://api.fastcrw.com';
+  'https://api.fastcrw.com'
+).replace(/\/+$/, '');
 
 const FASTCRW_API_KEY = process.env.FASTCRW_API_KEY;
 
@@ -89,6 +96,27 @@ const MAX_BUFFER_SIZE = positiveNumber(
   1024 * 1024
 );
 
+// Reuse upstream TCP/TLS sockets across requests. LIFO scheduling favors
+// recently-used free sockets and reduces the chance of reusing stale ones.
+const HTTP_AGENT_OPTIONS = {
+  keepAlive: true,
+  keepAliveMsecs: 1000,
+  maxSockets: 32,
+  maxFreeSockets: 8,
+  scheduling: 'lifo'
+};
+
+const httpAgent = new http.Agent(HTTP_AGENT_OPTIONS);
+const httpsAgent = new https.Agent(HTTP_AGENT_OPTIONS);
+
+const httpClient = axios.create({
+  httpAgent,
+  httpsAgent,
+  timeout: REQUEST_TIMEOUT_MS,
+  maxBodyLength: 20 * 1024 * 1024,
+  maxContentLength: 20 * 1024 * 1024
+});
+
 // ---------------------------------------------------------------------------
 // FASTCRW limits
 //
@@ -121,6 +149,35 @@ const MAX_SEARCHES_PER_REQUEST = clamp(
   ),
   1,
   8
+);
+
+// One additional model turn may repair malformed/failed tool calls without
+// increasing the external-search budget.
+const MAX_TOOL_RECOVERY_ATTEMPTS = clamp(
+  integerOrDefault(
+    process.env.MAX_TOOL_RECOVERY_ATTEMPTS,
+    1
+  ),
+  0,
+  2
+);
+
+const MAX_TOOL_CALLS_PER_RESPONSE = clamp(
+  integerOrDefault(
+    process.env.MAX_TOOL_CALLS_PER_RESPONSE,
+    4
+  ),
+  1,
+  8
+);
+
+const FASTCRW_RETRY_COUNT = clamp(
+  integerOrDefault(
+    process.env.FASTCRW_RETRY_COUNT,
+    1
+  ),
+  0,
+  2
 );
 
 const MAX_SEARCH_CALLS_PER_ROUND = clamp(
@@ -180,79 +237,50 @@ const FASTCRW_MAX_TOKENS = clamp(
 // MODEL MAPPING
 // ===========================================================================
 
-const MODEL_MAPPING = {
-  'gpt-3.5-turbo':
+const MODEL_MAPPING = Object.freeze({
+  // Current NVIDIA free-endpoint models.
+  'minimax-m3.1-flash':
     'minimaxai/minimax-m3.1-flash',
 
-  'gpt-4':
+  'gpt-3.5-turbo':
+    'minimaxai/minimax-m3.1-flash', // legacy client alias
+
+  'nemotron-3-ultra':
     'nvidia/nemotron-3-ultra-550b-a55b',
 
-  'gpt-3.5':
-    'qwen/qwen3.5-397b-a17b',
+  'gpt-4':
+    'nvidia/nemotron-3-ultra-550b-a55b', // legacy client alias
+
+  'nemotron-3.5-lightning':
+    'nvidia/nemotron-3.5-lightning-30b-a3b',
+
+  'glm-5.3-flash':
+    'z-ai/glm-5.3-flash',
 
   'gpt-4-turbo':
-    'z-ai/glm-5.3-flash',
+    'z-ai/glm-5.3-flash', // legacy client alias
 
-  'gpt-4o':
-    'deepseek-ai/deepseek-v4-pro-0813',
-
-  'claude-3-opus':
-    'openai/gpt-oss-120b',
-
-  'claude-3-sonnet':
-    'openai/gpt-oss-20b',
-
-  'gemini-pro':
-    'nvidia/llama-3.3-nemotron-super-49b-v1.5',
-
-  'gemini-turbo':
-    'meta/llama-3.3-70b-instruct',
-
-  'gemini-turbo?':
-    'abacusai/dracarys-llama-3.1-70b-instruct',
-
-  'gpt-3.5o':
-    'nvidia/nemotron-mini-4b-instruct',
-
-  'gpt-4-flash':
-    'deepseek-ai/deepseek-v4-flash',
-
-  'glm-5.2':
-    'z-ai/glm-5.3',
-
-  'mistral':
+  'deepseek-v4.1-flash':
     'deepseek-ai/deepseek-v4.1-flash',
 
-  'mistral-turbo':
-    'mistralai/mistral-medium-3.5-128b',
+  'gpt-oss-20b':
+    'openai/gpt-oss-20b',
 
-  'mistral-pro':
-    'mistralai/mistral-small-4-119b-2603',
+  'claude-3-sonnet':
+    'mistralai/mistral-large-4-1t-a52b', // legacy client alias
 
-  'mistral-nemo':
+  'mistral-nemotron':
     'mistralai/mistral-nemotron',
 
-  'mistral-fast':
-    'mistralai/ministral-14b-instruct-2512',
+  'mistral-nemo':
+    'mistralai/mistral-nemotron', // legacy client alias
 
-  'google-light':
+  'gemma-4-31b':
     'google/gemma-4-31b-it',
 
-  'google-lightest':
-    'google/gemma-2-2b-it',
-
-  'google-lighter':
-    'google/gemma-3n-e4b-it',
-
-  'm3':
-    'z-ai/glm-5.3-flash',
-
-  'step-3.5-flash':
-    'stepfun-ai/step-3.5-flash',
-
-  'step-3.7-flash':
-    'stepfun-ai/step-3.7-flash'
-};
+  'google-light':
+    'google/gemma-4-31b-it' // legacy client alias
+});
 
 // ===========================================================================
 // RETRY POLICIES
@@ -275,8 +303,8 @@ const DEFAULT_RETRY_POLICY = Object.freeze({
   jitterMs: 1500
 });
 
-// GLM / M3 are treated more carefully because hammering a busy
-// endpoint with retries generally makes 429 behavior worse.
+// GLM Flash / MiniMax are treated conservatively: repeated retries can
+// amplify rate limiting on busy shared endpoints.
 const CONSERVATIVE_RETRY_POLICY = Object.freeze({
   retryCount: 1,
 
@@ -290,13 +318,10 @@ const CONSERVATIVE_RETRY_POLICY = Object.freeze({
 });
 
 const RETRY_POLICIES = {
-  'z-ai/glm-5.3':
+  'z-ai/glm-5.3-flash':
     CONSERVATIVE_RETRY_POLICY,
 
   'minimaxai/minimax-m3.1-flash':
-    CONSERVATIVE_RETRY_POLICY,
-
-  'moonshotai/kimi-k3':
     CONSERVATIVE_RETRY_POLICY
 };
 
@@ -305,6 +330,12 @@ const RETRYABLE_STATUS_CODES = new Set([
   502,
   503,
   504
+]);
+
+const SAFE_CONNECTION_RETRY_CODES = new Set([
+  'ECONNREFUSED',
+  'ENOTFOUND',
+  'EAI_AGAIN'
 ]);
 
 function getRetryPolicy(model) {
@@ -318,9 +349,33 @@ function getRetryPolicy(model) {
 // SMALL HELPERS
 // ===========================================================================
 
-function sleep(ms) {
-  return new Promise(resolve => {
-    setTimeout(resolve, ms);
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      const error = new Error('Request was cancelled.');
+      error.code = 'ERR_CANCELED';
+      reject(error);
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+
+    const onAbort = () => {
+      clearTimeout(timer);
+      cleanup();
+      const error = new Error('Request was cancelled.');
+      error.code = 'ERR_CANCELED';
+      reject(error);
+    };
+
+    const cleanup = () => {
+      signal?.removeEventListener('abort', onAbort);
+    };
+
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 
@@ -537,189 +592,16 @@ app.use(
 );
 
 // ===========================================================================
-// REASONING DELIMITER PARSER
-// ===========================================================================
-
-class DelimiterParser {
-  constructor(openTag, closeTag) {
-    this.openTag = openTag;
-    this.closeTag = closeTag;
-    this.inThinking = false;
-    this.buffer = '';
-  }
-
-  processChunk(chunk) {
-    if (!chunk) {
-      return {
-        content: '',
-        reasoning: ''
-      };
-    }
-
-    this.buffer += chunk;
-
-    let content = '';
-    let reasoning = '';
-
-    while (true) {
-      const target = this.inThinking
-        ? this.closeTag
-        : this.openTag;
-
-      const index =
-        this.buffer.indexOf(target);
-
-      if (index !== -1) {
-        const before =
-          this.buffer.slice(0, index);
-
-        if (this.inThinking) {
-          reasoning += before;
-        } else {
-          content += before;
-        }
-
-        this.inThinking =
-          !this.inThinking;
-
-        this.buffer =
-          this.buffer.slice(
-            index + target.length
-          );
-
-        continue;
-      }
-
-      // Preserve a possible partial delimiter
-      // at the end of the current chunk.
-      let partialLength = 0;
-
-      const maxLength = Math.min(
-        this.buffer.length,
-        target.length - 1
-      );
-
-      for (
-        let length = maxLength;
-        length > 0;
-        length--
-      ) {
-        const suffix =
-          this.buffer.slice(
-            this.buffer.length - length
-          );
-
-        if (target.startsWith(suffix)) {
-          partialLength = length;
-          break;
-        }
-      }
-
-      const safeLength =
-        this.buffer.length -
-        partialLength;
-
-      const safeText =
-        this.buffer.slice(
-          0,
-          safeLength
-        );
-
-      if (this.inThinking) {
-        reasoning += safeText;
-      } else {
-        content += safeText;
-      }
-
-      this.buffer =
-        this.buffer.slice(safeLength);
-
-      break;
-    }
-
-    return {
-      content,
-      reasoning
-    };
-  }
-
-  flush() {
-    const result = {
-      content: '',
-      reasoning: ''
-    };
-
-    if (this.buffer) {
-      if (this.inThinking) {
-        result.reasoning = this.buffer;
-      } else {
-        result.content = this.buffer;
-      }
-    }
-
-    this.buffer = '';
-
-    return result;
-  }
-}
-
-// ===========================================================================
 // REASONING NORMALIZATION
 // ===========================================================================
 
-const THINK_TAG_MODELS = new Set([
-  'qwen/qwen3.5-397b-a17b',
-  'nvidia/llama-3.3-nemotron-super-49b-v1.5'
-]);
-
-function createThinkingParser(model) {
-  if (!THINK_TAG_MODELS.has(model)) {
-    return null;
-  }
-
-  return new DelimiterParser(
-    '<think>',
-    '</think>'
-  );
-}
-
 class StreamNormalizer {
-  constructor(model) {
-    this.parser =
-      createThinkingParser(model);
-  }
-
   processDelta(delta) {
-    const normalized = {
-      ...delta
-    };
-
-    let reasoning =
+    const normalized = { ...delta };
+    const reasoning =
       normalized.reasoning ||
       normalized.reasoning_content ||
       '';
-
-    let content =
-      normalized.content ||
-      '';
-
-    if (
-      !reasoning &&
-      content &&
-      this.parser
-    ) {
-      const parsed =
-        this.parser.processChunk(content);
-
-      reasoning = parsed.reasoning;
-      content = parsed.content;
-    }
-
-    if (content) {
-      normalized.content = content;
-    } else {
-      delete normalized.content;
-    }
 
     if (reasoning) {
       normalized.reasoning = reasoning;
@@ -728,72 +610,29 @@ class StreamNormalizer {
     }
 
     delete normalized.reasoning_content;
-
     return normalized;
   }
 
   flush() {
-    if (!this.parser) {
-      return {
-        content: '',
-        reasoning: ''
-      };
-    }
-
-    return this.parser.flush();
+    return {
+      content: '',
+      reasoning: ''
+    };
   }
 }
 
-function normalizeNonStreamChoice(
-  choice,
-  model
-) {
+function normalizeNonStreamChoice(choice) {
   if (!choice) {
     return choice;
   }
 
-  const message =
-    choice.message || {};
-
-  let reasoning =
+  const message = choice.message || {};
+  const reasoning =
     message.reasoning ||
     message.reasoning_content ||
     '';
 
-  let content =
-    message.content ||
-    '';
-
-  if (
-    !reasoning &&
-    content &&
-    THINK_TAG_MODELS.has(model)
-  ) {
-    const parser =
-      createThinkingParser(model);
-
-    const parsed =
-      parser.processChunk(content);
-
-    const flushed =
-      parser.flush();
-
-    content =
-      (parsed.content || '') +
-      (flushed.content || '');
-
-    reasoning =
-      (parsed.reasoning || '') +
-      (flushed.reasoning || '');
-  }
-
-  const newMessage = {
-    ...message
-  };
-
-  if (content) {
-    newMessage.content = content;
-  }
+  const newMessage = { ...message };
 
   if (reasoning) {
     newMessage.reasoning = reasoning;
@@ -819,11 +658,10 @@ function getReasoningPayload(
 ) {
   const effort =
     typeof reasoningEffort === 'string'
-      ? reasoningEffort
+      ? reasoningEffort.toLowerCase()
       : undefined;
 
   switch (model) {
-    case 'nvidia/nemotron-3-super-120b-a12b':
     case 'nvidia/nemotron-3-ultra-550b-a55b': {
       if (!enableThinking) {
         return {};
@@ -835,135 +673,54 @@ function getReasoningPayload(
         }
       };
 
-      if (
-        model ===
-          'nvidia/nemotron-3-ultra-550b-a55b' &&
-        hasTools
-      ) {
-        payload.chat_template_kwargs
-          .force_nonempty_content = true;
+      if (hasTools) {
+        payload.chat_template_kwargs.force_nonempty_content = true;
       }
 
       return payload;
     }
 
-    case 'qwen/qwen3.5-397b-a17b':
-      // Qwen thinks by default.
-      if (enableThinking) {
-        return {};
-      }
-
-      return {
-        chat_template_kwargs: {
-          enable_thinking: false
-        }
-      };
-
-    case 'deepseek-ai/deepseek-v4-pro':
-    case 'deepseek-ai/deepseek-v4-flash': {
-      if (!enableThinking) {
-        return {};
-      }
-
-      const payload = {
-        chat_template_kwargs: {
-          thinking: true
-        }
-      };
-
-      if (effort) {
-        payload.chat_template_kwargs
-          .reasoning_effort = effort;
-      }
-
-      return payload;
-    }
+    case 'nvidia/nemotron-3.5-lightning-30b-a3b':
+      return enableThinking
+        ? {
+            chat_template_kwargs: {
+              enable_thinking: true
+            }
+          }
+        : {
+            chat_template_kwargs: {
+              enable_thinking: false
+            }
+          };
 
     case 'minimaxai/minimax-m3.1-flash': {
-      if (
-        effort &&
-        ['low', 'medium', 'high', 'xhigh', 'max']
-          .includes(effort)
-      ) {
+      const allowedEfforts = new Set([
+        'low', 'medium', 'high', 'xhigh', 'max'
+      ]);
+
+      if (effort && allowedEfforts.has(effort)) {
         return {
           reasoning_effort: effort
         };
       }
 
-      if (enableThinking) {
-        return {
-          reasoning_effort: 'max'
-        };
-      }
-
-      return {};
-    }
-
-    case 'mistralai/mistral-medium-3.5-128b':
-    case 'mistralai/mistral-small-4-119b-2603': {
-      if (
-        effort &&
-        ['high', 'none']
-          .includes(effort)
-      ) {
-        return {
-          reasoning_effort: effort
-        };
-      }
-
-      if (enableThinking) {
-        return {
-          reasoning_effort: 'high'
-        };
-      }
-
-      return {};
-    }
-
-    case 'z-ai/glm-5.2': {
-      const payload = {
-        thinking: {
-          type:
-            enableThinking
-              ? 'enabled'
-              : 'disabled'
-        }
-      };
-
-      if (
-        enableThinking &&
-        effort
-      ) {
-        payload.reasoning_effort =
-          effort;
-      }
-
-      return payload;
+      return enableThinking
+        ? { reasoning_effort: 'max' }
+        : {};
     }
 
     case 'google/gemma-4-31b-it':
-      if (!enableThinking) {
-        return {};
-      }
-
-      return {
-        chat_template_kwargs: {
-          enable_thinking: true
-        }
-      };
-
-    case 'stepfun-ai/step-3.7-flash':
-      if (enableThinking) {
-        return {};
-      }
-
-      return {
-        chat_template_kwargs: {
-          thinking: false
-        }
-      };
+      return enableThinking
+        ? {
+            chat_template_kwargs: {
+              enable_thinking: true
+            }
+          }
+        : {};
 
     default:
+      // Do not send reasoning knobs to models whose NIM templates do not
+      // document them; silently ignored/invalid fields are worse than defaults.
       return {};
   }
 }
@@ -1067,6 +824,14 @@ function getStatusMessage(status) {
   }
 }
 
+function isSafeToRetryConnectionError(error) {
+  // These codes indicate that a connection could not be established or DNS
+  // could not resolve. Avoid retrying ambiguous post-send resets/timeouts.
+  const code = error?.code || error?.cause?.code;
+
+  return SAFE_CONNECTION_RETRY_CODES.has(code);
+}
+
 async function postNIM(
   requestBody,
   options = {}
@@ -1090,7 +855,7 @@ async function postNIM(
     attempt++
   ) {
     try {
-      return await axios.post(
+      return await httpClient.post(
         `${NIM_API_BASE}/chat/completions`,
         requestBody,
         {
@@ -1105,6 +870,7 @@ async function postNIM(
           },
 
           timeout,
+          signal: options.signal,
 
           // Make Axios reject non-2xx responses so
           // the retry logic can inspect them.
@@ -1118,9 +884,8 @@ async function postNIM(
         error.response?.status;
 
       const retryable =
-        RETRYABLE_STATUS_CODES.has(
-          status
-        );
+        RETRYABLE_STATUS_CODES.has(status) ||
+        (!error.response && isSafeToRetryConnectionError(error));
 
       const lastAttempt =
         attempt >= policy.retryCount;
@@ -1133,9 +898,7 @@ async function postNIM(
       }
 
       const retryAfter =
-        error.response?.headers?.[
-          'retry-after'
-        ];
+        error.response?.headers?.['retry-after'];
 
       const delay =
         calculateBackoff(
@@ -1146,13 +909,13 @@ async function postNIM(
         );
 
       console.warn(
-        `[NIM] ${getStatusMessage(status)} ` +
+        `[NIM] ${status ? getStatusMessage(status) : 'Connection setup failed'} ` +
         `for ${model}. ` +
         `Retrying in ${delay}ms ` +
         `(retry ${attempt + 1}/${policy.retryCount})`
       );
 
-      await sleep(delay);
+      await sleep(delay, options.signal);
     }
   }
 
@@ -1235,7 +998,8 @@ const FASTCRW_TOOLS = [
 // ===========================================================================
 
 async function waitForSearchCooldown(
-  lastSearchAt
+  lastSearchAt,
+  signal
 ) {
   if (!lastSearchAt) {
     return;
@@ -1249,7 +1013,7 @@ async function waitForSearchCooldown(
     elapsed;
 
   if (remaining > 0) {
-    await sleep(remaining);
+    await sleep(remaining, signal);
   }
 }
 
@@ -1338,7 +1102,8 @@ function isDuplicateOrSimilarQuery(
 async function fastcrwSearch(
   query,
   limit = 3,
-  timeRange = 'any'
+  timeRange = 'any',
+  signal
 ) {
   const safeLimit = clamp(
     Number(limit) || 3,
@@ -1351,56 +1116,71 @@ async function fastcrwSearch(
     limit: safeLimit
   };
 
-  if (
-    timeRange &&
-    timeRange !== 'any'
-  ) {
-    params.time_range =
-      timeRange;
+  if (timeRange && timeRange !== 'any') {
+    params.time_range = timeRange;
   }
 
-  try {
-    const response =
-      await axios.get(
+  for (let attempt = 0; attempt <= FASTCRW_RETRY_COUNT; attempt++) {
+    try {
+      const response = await httpClient.get(
         `${FASTCRW_API_BASE}/search`,
         {
           params,
-
           headers: {
-            Authorization:
-              `Bearer ${FASTCRW_API_KEY}`,
-
-            'Content-Type':
-              'application/json'
+            Authorization: `Bearer ${FASTCRW_API_KEY}`,
+            'Content-Type': 'application/json'
           },
-
-          timeout:
-            FASTCRW_TIMEOUT_MS,
-
-          validateStatus: status =>
-            status >= 200 &&
-            status < 300
+          timeout: FASTCRW_TIMEOUT_MS,
+          signal,
+          validateStatus: status => status >= 200 && status < 300
         }
       );
 
-    return response.data;
-  } catch (error) {
-    console.error(
-      '[FASTCRW] Search failed:',
-      error.response?.status ||
-        'unknown',
-      error.message
-    );
+      return response.data;
+    } catch (error) {
+      if (signal?.aborted || error.code === 'ERR_CANCELED') {
+        throw error;
+      }
 
-    if (error.response?.data) {
+      const status = error.response?.status;
+      const retryableStatus = new Set([502, 503, 504]).has(status);
+      const retryableConnection = !error.response && new Set([
+        'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND'
+      ]).has(error.code || error.cause?.code);
+      const canRetry = attempt < FASTCRW_RETRY_COUNT &&
+        (retryableStatus || retryableConnection);
+
+      if (canRetry) {
+        const delay = Math.min(750 * (2 ** attempt), 3000) +
+          Math.floor(Math.random() * 400);
+
+        console.warn(
+          `[FASTCRW] Transient search failure (${status || error.code || 'network'}). ` +
+          `Retrying once in ${delay}ms.`
+        );
+
+        await sleep(delay, signal);
+        continue;
+      }
+
       console.error(
-        '[FASTCRW] Upstream response:',
-        error.response.data
+        '[FASTCRW] Search failed:',
+        status || 'unknown',
+        error.message
       );
-    }
 
-    throw error;
+      if (error.response?.data) {
+        console.error(
+          '[FASTCRW] Upstream response:',
+          error.response.data
+        );
+      }
+
+      throw error;
+    }
   }
+
+  throw new Error('FASTCRW search failed after retry policy was exhausted.');
 }
 
 // ===========================================================================
@@ -1418,27 +1198,140 @@ function makeToolResult(
   };
 }
 
-function parseToolArguments(toolCall) {
-  try {
-    const raw =
-      toolCall.function?.arguments ||
-      '{}';
+function extractFirstJsonObject(text) {
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
 
-    const parsed =
-      JSON.parse(raw);
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
 
-    if (
-      !parsed ||
-      typeof parsed !== 'object' ||
-      Array.isArray(parsed)
-    ) {
-      return null;
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
     }
 
-    return parsed;
-  } catch {
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (char === '{') {
+      if (start === -1) start = index;
+      depth++;
+    } else if (char === '}' && start !== -1) {
+      depth--;
+      if (depth === 0) {
+        return text.slice(start, index + 1);
+      }
+    }
+  }
+
+  return null;
+}
+
+function parseToolArguments(toolCall) {
+  const raw = toolCall?.function?.arguments;
+
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    return raw;
+  }
+
+  if (typeof raw !== 'string') {
     return null;
   }
+
+  let candidate = raw.trim();
+
+  // Some providers wrap an otherwise valid JSON object in a code fence.
+  candidate = candidate
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/, '')
+    .trim();
+
+  const candidates = [candidate, extractFirstJsonObject(candidate)]
+    .filter(Boolean);
+
+  for (const value of candidates) {
+    try {
+      let parsed = JSON.parse(value);
+
+      // A few compatibility layers JSON-encode the arguments twice.
+      if (typeof parsed === 'string') {
+        parsed = JSON.parse(parsed);
+      }
+
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed;
+      }
+    } catch {
+      // Try the next narrowly-scoped candidate.
+    }
+  }
+
+  return null;
+}
+
+function getAssistantToolCalls(message, round) {
+  const toolCalls = message?.tool_calls;
+
+  if (Array.isArray(toolCalls) && toolCalls.length) {
+    return toolCalls;
+  }
+
+  if (typeof toolCalls === 'string') {
+    try {
+      const parsed = JSON.parse(toolCalls);
+      if (Array.isArray(parsed) && parsed.length) {
+        return parsed;
+      }
+    } catch {
+      // Fall through to the legacy function_call shape.
+    }
+  }
+
+  if (toolCalls && typeof toolCalls === 'object' && !Array.isArray(toolCalls)) {
+    return [toolCalls];
+  }
+
+  // Legacy OpenAI function_call compatibility.
+  if (message?.function_call && typeof message.function_call === 'object') {
+    return [{
+      id: `call_legacy_${round + 1}`,
+      type: 'function',
+      function: message.function_call
+    }];
+  }
+
+  return [];
+}
+
+function normalizeToolCallId(toolCall, round, index, usedIds) {
+  const supplied = typeof toolCall?.id === 'string'
+    ? toolCall.id.trim()
+    : '';
+
+  if (supplied && supplied.length <= 128 && !usedIds.has(supplied)) {
+    usedIds.add(supplied);
+    return supplied;
+  }
+
+  let fallback = `call_proxy_${round + 1}_${index + 1}`;
+  let suffix = 1;
+
+  while (usedIds.has(fallback)) {
+    fallback = `call_proxy_${round + 1}_${index + 1}_${suffix++}`;
+  }
+
+  usedIds.add(fallback);
+  return fallback;
 }
 
 // ===========================================================================
@@ -1456,7 +1349,8 @@ async function runSynthesisRequest({
   temperature,
   max_tokens,
   enableThinking,
-  reasoningEffort
+  reasoningEffort,
+  signal
 }) {
   const reasoningPayload =
     getReasoningPayload(
@@ -1492,7 +1386,8 @@ async function runSynthesisRequest({
 
   const response =
     await postNIM(
-      requestBody
+      requestBody,
+      { signal }
     );
 
   return response.data;
@@ -1508,54 +1403,46 @@ async function runWithWebSearch({
   temperature,
   max_tokens,
   enableThinking,
-  reasoningEffort
+  reasoningEffort,
+  signal
 }) {
-  const workingMessages =
-    Array.isArray(messages)
-      ? messages.map(message => ({
-          ...message
-        }))
-      : [];
+  const workingMessages = Array.isArray(messages)
+    ? messages.map(message => ({ ...message }))
+    : [];
 
   const searchedQueries = [];
+  const usedToolCallIds = new Set();
 
   let totalSearches = 0;
   let lastSearchAt = 0;
+  let searchRounds = 0;
+  let recoveryRounds = 0;
 
-  for (
-    let round = 0;
-    round < MAX_TOOL_ROUNDS;
-    round++
-  ) {
+  // Recovery turns are separate from normal tool rounds and never increase
+  // the configured number of actual searches.
+  const maxTurns = MAX_TOOL_ROUNDS + MAX_TOOL_RECOVERY_ATTEMPTS;
+
+  for (let turn = 0; turn < maxTurns; turn++) {
+    if (signal?.aborted) {
+      throw new Error('Client disconnected before the search request completed.');
+    }
+
     console.log(
-      `[FASTCRW] Round ${round + 1}/${MAX_TOOL_ROUNDS} ` +
+      `[FASTCRW] Turn ${turn + 1}/${maxTurns} ` +
+      `| search rounds ${searchRounds}/${MAX_TOOL_ROUNDS} ` +
       `| searches ${totalSearches}/${MAX_SEARCHES_PER_REQUEST}`
     );
 
-    // Once the global search budget has been exhausted,
-    // don't even advertise the tool anymore.
-    const canSearch =
-      totalSearches <
-      MAX_SEARCHES_PER_REQUEST;
-
+    const canSearch = totalSearches < MAX_SEARCHES_PER_REQUEST;
     const requestBody = {
       model: selectedModel,
-
-      messages:
-        workingMessages,
-
-      temperature:
-        temperature ?? 0.7,
-
-      max_tokens:
-        Math.min(
-          max_tokens ??
-            FASTCRW_MAX_TOKENS,
-          FASTCRW_MAX_TOKENS
-        ),
-
+      messages: workingMessages,
+      temperature: temperature ?? 0.7,
+      max_tokens: Math.min(
+        max_tokens ?? FASTCRW_MAX_TOKENS,
+        FASTCRW_MAX_TOKENS
+      ),
       stream: false,
-
       ...getReasoningPayload(
         selectedModel,
         enableThinking,
@@ -1565,279 +1452,228 @@ async function runWithWebSearch({
     };
 
     if (canSearch) {
-      requestBody.tools =
-        FASTCRW_TOOLS;
-
-      requestBody.tool_choice =
-        'auto';
+      requestBody.tools = FASTCRW_TOOLS;
+      requestBody.tool_choice = 'auto';
     }
 
-    const response =
-      await postNIM(
-        requestBody
-      );
-
-    const assistantMessage =
-      response.data
-        ?.choices?.[0]
-        ?.message;
+    const response = await postNIM(requestBody, { signal });
+    const choice = response.data?.choices?.[0];
+    const assistantMessage = choice?.message;
 
     if (!assistantMessage) {
-      console.warn(
-        '[FASTCRW] NIM returned no assistant message.'
+      console.warn('[FASTCRW] NIM returned no assistant message.');
+      return response.data;
+    }
+
+    const rawToolCalls = getAssistantToolCalls(assistantMessage, turn);
+
+    // If the provider signals a tool call but omits its payload, give it one
+    // explicit correction turn instead of silently treating it as a final answer.
+    if (
+      rawToolCalls.length === 0 &&
+      choice?.finish_reason === 'tool_calls'
+    ) {
+      workingMessages.push({
+        role: 'system',
+        content:
+          'Your previous response indicated a tool call but did not include a valid tool_calls array. ' +
+          'Retry only if a web search is necessary, using one valid search_web function call with JSON arguments.'
+      });
+
+      if (recoveryRounds < MAX_TOOL_RECOVERY_ATTEMPTS) {
+        recoveryRounds++;
+        console.warn('[FASTCRW] Recovering an empty tool-call response.');
+        continue;
+      }
+
+      break;
+    }
+
+    if (rawToolCalls.length === 0) {
+      return response.data;
+    }
+
+    const normalizedCalls = rawToolCalls.map((toolCall, index) => {
+      const id = normalizeToolCallId(
+        toolCall,
+        turn,
+        index,
+        usedToolCallIds
       );
 
-      return response.data;
-    }
+      if (!toolCall || typeof toolCall !== 'object') {
+        return {
+          id,
+          type: 'function',
+          function: {
+            name: '__invalid_tool_call__',
+            arguments: '{}'
+          }
+        };
+      }
 
-    const toolCalls =
-      Array.isArray(
-        assistantMessage.tool_calls
-      )
-        ? assistantMessage.tool_calls
-        : [];
+      return {
+        ...toolCall,
+        id,
+        type: toolCall.type || 'function',
+        function: toolCall.function && typeof toolCall.function === 'object'
+          ? toolCall.function
+          : {
+              name: '__invalid_tool_call__',
+              arguments: '{}'
+            }
+      };
+    });
 
-    // Model answered directly.
-    if (toolCalls.length === 0) {
-      return response.data;
-    }
+    const normalizedAssistantMessage = {
+      ...assistantMessage,
+      tool_calls: normalizedCalls
+    };
+    delete normalizedAssistantMessage.function_call;
 
-    workingMessages.push(
-      assistantMessage
-    );
+    workingMessages.push(normalizedAssistantMessage);
 
     let searchesThisRound = 0;
+    let hadRecoverableFailure = false;
 
-    for (const toolCall of toolCalls) {
-      const functionName =
-        toolCall.function?.name;
+    for (let index = 0; index < normalizedCalls.length; index++) {
+      const toolCall = normalizedCalls[index];
+      const functionName = toolCall.function?.name;
+      const toolCallId = toolCall.id;
 
-      // Unknown tool.
-      if (
-        functionName !==
-        'search_web'
-      ) {
+      const pushToolError = error => {
+        hadRecoverableFailure = true;
         workingMessages.push(
-          makeToolResult(
-            toolCall.id,
-            {
-              success: false,
-              error:
-                `Unknown tool: ${functionName}`
-            }
-          )
+          makeToolResult(toolCallId, {
+            success: false,
+            error
+          })
         );
+      };
 
+      if (index >= MAX_TOOL_CALLS_PER_RESPONSE) {
+        pushToolError(
+          `Too many tool calls were returned. Process at most ${MAX_TOOL_CALLS_PER_RESPONSE} per response; retry with one focused search.`
+        );
         continue;
       }
 
-      // Global limit.
-      if (
-        totalSearches >=
-        MAX_SEARCHES_PER_REQUEST
-      ) {
-        workingMessages.push(
-          makeToolResult(
-            toolCall.id,
-            {
-              success: false,
-
-              error:
-                'The web-search budget has been exhausted. ' +
-                'Use the information already gathered and answer the user.'
-            }
-          )
-        );
-
+      if (functionName !== 'search_web') {
+        pushToolError(`Unknown tool: ${functionName || 'unnamed tool'}`);
         continue;
       }
 
-      // Per-round limit.
-      if (
-        searchesThisRound >=
-        MAX_SEARCH_CALLS_PER_ROUND
-      ) {
-        workingMessages.push(
-          makeToolResult(
-            toolCall.id,
-            {
-              success: false,
-
-              error:
-                'Only one focused web search is allowed in this round. ' +
-                'Inspect the existing results instead.'
-            }
-          )
+      if (totalSearches >= MAX_SEARCHES_PER_REQUEST) {
+        pushToolError(
+          'The web-search budget has been exhausted. Use the information already gathered and answer the user.'
         );
-
         continue;
       }
 
-      const args =
-        parseToolArguments(
-          toolCall
+      if (searchesThisRound >= MAX_SEARCH_CALLS_PER_ROUND) {
+        pushToolError(
+          'Only one focused web search is allowed in this round. Inspect the existing results instead.'
         );
+        continue;
+      }
 
+      const args = parseToolArguments(toolCall);
       if (!args) {
-        workingMessages.push(
-          makeToolResult(
-            toolCall.id,
-            {
-              success: false,
-              error:
-                'Invalid search tool arguments.'
-            }
-          )
+        pushToolError(
+          'Invalid JSON arguments. Retry with a valid JSON object containing a string query field.'
         );
-
         continue;
       }
 
-      const query =
-        cleanSearchQuery(
-          args.query
-        );
-
-      if (
-        !isValidSearchQuery(query)
-      ) {
-        workingMessages.push(
-          makeToolResult(
-            toolCall.id,
-            {
-              success: false,
-
-              error:
-                `Search query must contain between 2 and ` +
-                `${MAX_SEARCH_QUERY_LENGTH} characters.`
-            }
-          )
-        );
-
+      if (typeof args.query !== 'string') {
+        pushToolError('The query argument must be a string.');
         continue;
       }
 
-      // Duplicate protection.
-      if (
-        isDuplicateOrSimilarQuery(
-          query,
-          searchedQueries
-        )
-      ) {
-        console.log(
-          `[FASTCRW] Blocked duplicate query: "${query}"`
+      const query = cleanSearchQuery(args.query);
+      if (!isValidSearchQuery(query)) {
+        pushToolError(
+          `Search query must contain between 2 and ${MAX_SEARCH_QUERY_LENGTH} characters.`
         );
-
-        workingMessages.push(
-          makeToolResult(
-            toolCall.id,
-            {
-              success: false,
-
-              error:
-                'A substantially identical search has already been performed. ' +
-                'Use those results instead of searching again.'
-            }
-          )
-        );
-
         continue;
       }
 
-      const limit =
-        clamp(
-          Number(args.limit) || 3,
-          1,
-          MAX_SEARCH_RESULTS
+      if (isDuplicateOrSimilarQuery(query, searchedQueries)) {
+        console.log(`[FASTCRW] Blocked duplicate query: "${query}"`);
+        pushToolError(
+          'A substantially identical search has already been performed. Use those results instead of repeating it.'
         );
+        continue;
+      }
 
+      const limit = clamp(Number(args.limit) || 3, 1, MAX_SEARCH_RESULTS);
       const allowedTimeRanges = new Set([
-        'hour',
-        'day',
-        'week',
-        'month',
-        'year',
-        'any'
+        'hour', 'day', 'week', 'month', 'year', 'any'
       ]);
+      const timeRange = allowedTimeRanges.has(args.time_range)
+        ? args.time_range
+        : 'any';
 
-      const timeRange =
-        allowedTimeRanges.has(
-          args.time_range
-        )
-          ? args.time_range
-          : 'any';
+      await waitForSearchCooldown(lastSearchAt, signal);
+      if (signal?.aborted) {
+        throw new Error('Client disconnected during search cooldown.');
+      }
 
-      // Pace searches.
-      await waitForSearchCooldown(
-        lastSearchAt
-      );
-
-      // Mark the search time immediately before
-      // making the request, not after it.
       lastSearchAt = Date.now();
-
       totalSearches++;
       searchesThisRound++;
 
-      searchedQueries.push(query);
-
-      if (
-        searchedQueries.length >
-        MAX_QUERY_HISTORY
-      ) {
-        searchedQueries.shift();
-      }
-
       console.log(
-        `[FASTCRW] Search ` +
-        `${totalSearches}/${MAX_SEARCHES_PER_REQUEST}: ` +
-        `"${query}"`
+        `[FASTCRW] Search ${totalSearches}/${MAX_SEARCHES_PER_REQUEST}: "${query}"`
       );
 
       try {
-        const result =
-          await fastcrwSearch(
-            query,
-            limit,
-            timeRange
-          );
+        const result = await fastcrwSearch(
+          query,
+          limit,
+          timeRange,
+          signal
+        );
+
+        searchedQueries.push(query);
+        if (searchedQueries.length > MAX_QUERY_HISTORY) {
+          searchedQueries.shift();
+        }
 
         workingMessages.push(
-          makeToolResult(
-            toolCall.id,
-            result
-          )
+          makeToolResult(toolCallId, result)
         );
       } catch (error) {
-        console.error(
-          '[FASTCRW] Search failed:',
-          error.message
-        );
+        if (signal?.aborted || error.code === 'ERR_CANCELED') {
+          throw error;
+        }
 
-        workingMessages.push(
-          makeToolResult(
-            toolCall.id,
-            {
-              success: false,
-
-              error:
-                'The web search failed. ' +
-                'Continue using the available conversation context.'
-            }
-          )
+        console.error('[FASTCRW] Search failed:', error.message);
+        pushToolError(
+          'The web search failed after a transient retry. You may retry once with a focused query if the search budget allows; otherwise answer from the available context.'
         );
       }
     }
 
-    // Let the model inspect the search result and decide
-    // whether it genuinely needs another search.
-    //
-    // The next round is still subject to both hard limits.
+    if (searchesThisRound > 0) {
+      searchRounds++;
+    }
+
+    if (hadRecoverableFailure) {
+      if (recoveryRounds < MAX_TOOL_RECOVERY_ATTEMPTS) {
+        recoveryRounds++;
+        console.warn(
+          `[FASTCRW] Recovering tool call(s) (${recoveryRounds}/${MAX_TOOL_RECOVERY_ATTEMPTS}).`
+        );
+        continue;
+      }
+
+      break;
+    }
+
     if (
-      totalSearches <
-        MAX_SEARCHES_PER_REQUEST &&
-      round + 1 <
-        MAX_TOOL_ROUNDS
+      totalSearches < MAX_SEARCHES_PER_REQUEST &&
+      searchRounds < MAX_TOOL_ROUNDS
     ) {
       continue;
     }
@@ -1846,23 +1682,17 @@ async function runWithWebSearch({
   }
 
   console.log(
-    '[FASTCRW] Search/tool budget exhausted. ' +
-    'Starting final synthesis.'
+    '[FASTCRW] Search/tool budget exhausted. Starting final synthesis.'
   );
 
   return runSynthesisRequest({
     selectedModel,
-
-    messages:
-      workingMessages,
-
+    messages: workingMessages,
     temperature,
-
     max_tokens,
-
     enableThinking,
-
-    reasoningEffort
+    reasoningEffort,
+    signal
   });
 }
 
@@ -1878,7 +1708,8 @@ async function callNIM({
   stream,
   enableThinking,
   reasoningEffort,
-  hasTools
+  hasTools,
+  signal
 }) {
   const requestBody = {
     model: selectedModel,
@@ -1913,11 +1744,10 @@ async function callNIM({
   const response =
     await postNIM(
       requestBody,
-      stream
-        ? {
-            responseType: 'stream'
-          }
-        : {}
+      {
+        ...(stream ? { responseType: 'stream' } : {}),
+        signal
+      }
     );
 
   return {
@@ -1960,10 +1790,7 @@ function buildOpenAIResponse(
       )
         ? nimData.choices.map(
             (choice, index) => ({
-              ...normalizeNonStreamChoice(
-                choice,
-                actualModel
-              ),
+              ...normalizeNonStreamChoice(choice),
 
               index
             })
@@ -2179,7 +2006,6 @@ function streamCompletedResponse(
 // ===========================================================================
 
 function handleNIMStream({
-  req,
   res,
   upstreamStream,
   usedModel
@@ -2198,6 +2024,7 @@ function handleNIMStream({
   let doneSent = false;
   let cleanEnd = false;
   let cleanedUp = false;
+  let onClientClose;
   let reasoningOpen = false;
 
   const cleanup = () => {
@@ -2211,14 +2038,31 @@ function handleNIMStream({
       upstreamStream.removeAllListeners();
     }
 
-    req.removeAllListeners(
-      'close'
-    );
+    if (onClientClose) {
+      res.removeListener('close', onClientClose);
+    }
   };
 
   const finish = () => {
     if (doneSent) {
       return;
+    }
+
+    // Close the optional inline reasoning envelope even when the upstream
+    // ends immediately after its final reasoning delta.
+    if (SHOW_REASONING && reasoningOpen) {
+      sendSSE(res, {
+        choices: [
+          {
+            index: 0,
+            delta: {
+              content: '\n</thinking>'
+            },
+            finish_reason: null
+          }
+        ]
+      });
+      reasoningOpen = false;
     }
 
     sendDone(res);
@@ -2528,26 +2372,22 @@ function handleNIMStream({
     }
   );
 
-  req.on(
-    'close',
-    () => {
-      if (!cleanEnd) {
-        console.warn(
-          '[STREAM] Client disconnected.'
-        );
-      }
+  onClientClose = () => {
+    // IncomingMessage 'close' fires when the request body has completed,
+    // not necessarily when the downstream client disconnects. The response
+    // is the correct lifecycle signal for an active SSE stream.
+    if (!res.writableFinished && !cleanEnd) {
+      console.warn('[STREAM] Client disconnected.');
 
-      if (
-        upstreamStream &&
-        !upstreamStream.destroyed &&
-        !cleanEnd
-      ) {
+      if (upstreamStream && !upstreamStream.destroyed) {
         upstreamStream.destroy();
       }
-
-      cleanup();
     }
-  );
+
+    cleanup();
+  };
+
+  res.once('close', onClientClose);
 }
 
 // ===========================================================================
@@ -2569,7 +2409,7 @@ async function validateModels() {
 
   try {
     const response =
-      await axios.get(
+      await httpClient.get(
         `${NIM_API_BASE}/models`,
         {
           headers: {
@@ -2694,7 +2534,7 @@ async function sendDiscordAlert(
   };
 
   try {
-    await axios.post(
+    await httpClient.post(
       DISCORD_WEBHOOK_URL,
       {
         embeds: [embed],
@@ -2780,7 +2620,7 @@ app.get(
   (req, res) => {
     res.json({
       status: 'ok',
-      version: '4.1.0'
+      version: APP_VERSION
     });
   }
 );
@@ -2826,6 +2666,13 @@ app.post(
   '/v1/chat/completions',
   async (req, res) => {
     let upstreamStream = null;
+    const abortController = new AbortController();
+    const abortOnDisconnect = () => {
+      if (!res.writableFinished && !abortController.signal.aborted) {
+        abortController.abort();
+      }
+    };
+    res.once('close', abortOnDisconnect);
 
     try {
       const body =
@@ -2936,7 +2783,8 @@ app.post(
 
             enableThinking,
 
-            reasoningEffort
+            reasoningEffort,
+            signal: abortController.signal
           });
 
         const response =
@@ -2994,7 +2842,8 @@ app.post(
 
           reasoningEffort,
 
-          hasTools: false
+          hasTools: false,
+          signal: abortController.signal
         });
 
       upstreamStream =
@@ -3035,8 +2884,6 @@ app.post(
       // ---------------------------------------------------------------------
 
       return handleNIMStream({
-        req,
-
         res,
 
         upstreamStream,
@@ -3045,6 +2892,10 @@ app.post(
           result.usedModel
       });
     } catch (error) {
+      if (abortController.signal.aborted || res.destroyed) {
+        return;
+      }
+
       console.error(
         '[PROXY] Request failed:',
         error.message
@@ -3100,6 +2951,8 @@ app.post(
       ) {
         upstreamStream.destroy();
       }
+    } finally {
+      res.removeListener('close', abortOnDisconnect);
     }
   }
 );
@@ -3157,11 +3010,11 @@ app.use(
 // STARTUP
 // ===========================================================================
 
-app.listen(
+const server = app.listen(
   PORT,
   () => {
     console.log(
-      `[PROXY] Hybrid NIM proxy running on port ${PORT}`
+      `[PROXY] Hybrid NIM proxy v${APP_VERSION} running on port ${PORT}`
     );
 
     console.log(
@@ -3175,7 +3028,7 @@ app.listen(
 
     console.log(
       `[PROXY] FASTCRW limits: ` +
-      `${MAX_TOOL_ROUNDS} rounds / ` +
+      `${MAX_TOOL_ROUNDS} search rounds + ${MAX_TOOL_RECOVERY_ATTEMPTS} recovery turns / ` +
       `${MAX_SEARCHES_PER_REQUEST} searches / ` +
       `${MAX_SEARCH_CALLS_PER_ROUND} per round`
     );
@@ -3187,7 +3040,7 @@ app.listen(
 
     console.log(
       '[PROXY] Retry profiles: ' +
-      'default + conservative GLM/M3/Kimi'
+      'default + conservative GLM Flash / MiniMax'
     );
 
     validateModels()
@@ -3199,3 +3052,8 @@ app.listen(
       });
   }
 );
+
+
+// Keep incoming client connections reusable behind Render/reverse proxies.
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
