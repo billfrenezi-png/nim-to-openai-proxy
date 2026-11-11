@@ -279,7 +279,7 @@ const MODEL_MAPPING = Object.freeze({
     'google/gemma-4-31b-it',
 
   'google-light':
-    'google/gemma-4-31b-it' // legacy client alias
+    'moonshotai/Kimi-K3.1-Pro' // legacy client alias
 });
 
 // ===========================================================================
